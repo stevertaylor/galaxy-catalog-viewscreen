@@ -537,25 +537,25 @@ html_code_template = """
   .tooltip {
     position: absolute;
     pointer-events: none;
-    background: rgba(15, 23, 42, 0.95);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid rgba(71, 85, 105, 0.6);
-    border-radius: 10px;
+    background: rgba(15, 23, 42, 0.7);
+    backdrop-filter: blur(12px) saturate(180%);
+    -webkit-backdrop-filter: blur(12px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
     padding: 12px 14px;
     font-size: 11px;
     color: #e2e8f0;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 20px rgba(34, 211, 238, 0.1);
-    z-index: 100;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 20px rgba(34, 211, 238, 0.05);
+    z-index: 1000;
     opacity: 0;
-    transform: translateY(5px);
-    transition: opacity 0.15s ease, transform 0.15s ease;
-    max-width: 200px;
+    transform: translateY(5px) scale(0.98);
+    transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    max-width: 220px;
   }
   
   .tooltip.visible {
     opacity: 1;
-    transform: translateY(0);
+    transform: translateY(0) scale(1);
   }
   
   .tooltip-id {
@@ -677,12 +677,20 @@ html_code_template = """
     <!-- Background Toggles -->
     <div class="slider-control" style="margin-top: 8px;">
        <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8; margin-bottom: 8px;">
+         <input type="checkbox" id="grid-toggle" checked style="width: 16px; height: 16px; accent-color: #94a3b8;">
+          <span>Coordinate Grid Overlay</span>
+       </label>
+       <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8; margin-bottom: 8px;">
          <input type="checkbox" id="milkyway-toggle" checked style="width: 16px; height: 16px; accent-color: #a855f7;">
          <span>Milky Way Background</span>
        </label>
-       <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8;">
+       <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8; margin-bottom: 8px;">
          <input type="checkbox" id="starfield-toggle" checked style="width: 16px; height: 16px; accent-color: #22d3ee;">
           <span>Starfield Animation</span>
+       </label>
+       <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8;">
+         <input type="checkbox" id="tooltip-toggle" checked style="width: 16px; height: 16px; accent-color: #10b981;">
+          <span>Hover Tooltips</span>
        </label>
     </div>
      
@@ -906,6 +914,7 @@ function refreshData() {
     const p = projectMollweide(d.ra, d.dec);
     return { ...d, px: p.x, py: p.y };
   });
+  pulsarPoints = projectedData.filter(d => d.type === 'Pulsar');
   buildSpatialGrid();
   document.getElementById('count-total').innerText = rawData.length;
   draw();
@@ -946,11 +955,26 @@ function updateCanvasSize() {
   // Resize canvas
   if (ctx) {
     ctx = setupHighDPI(canvas, WIDTH, HEIGHT);
+    
+    // Setup offscreen grid canvas
+    const dpr = window.devicePixelRatio || 1;
+    gridCanvas.width = WIDTH * dpr;
+    gridCanvas.height = HEIGHT * dpr;
+    gridCtx.scale(dpr, dpr);
+    drawCoordinateGrid(gridCtx);
+
+    // Ensure canvas is centered in its container
+    canvas.style.position = 'absolute';
+    canvas.style.left = '50%';
+    canvas.style.top = '50%';
+    canvas.style.transform = 'translate(-50%, -50%)';
+
     // Reproject data with new dimensions
     projectedData = rawData.map(d => {
       const p = projectMollweide(d.ra, d.dec);
       return { ...d, px: p.x, py: p.y };
     });
+    pulsarPoints = projectedData.filter(d => d.type === 'Pulsar');
     buildSpatialGrid();
     draw();
   }
@@ -958,6 +982,7 @@ function updateCanvasSize() {
 
 // --- STATE ---
 let projectedData = [];
+let pulsarPoints = [];
 let mode = 'lasso';
 let selectedIds = new Set();
 let lassoPoints = [];
@@ -971,10 +996,14 @@ let animationTime = 0;
 let periodScale = 400; 
 let clickedId = null;
 let hoveredPoint = null;
+let tooltipsEnabled = true;
+let showGrid = true;
 
 // --- DOM ELEMENTS ---
 const canvas = document.getElementById('main-canvas');
 let ctx, distCtx, massCtx;
+let gridCanvas = document.createElement('canvas');
+let gridCtx = gridCanvas.getContext('2d');
 const inspector = document.getElementById('inspector');
 const btnPosterior = document.getElementById('btn-posterior');
 const posteriorControl = document.getElementById('posterior-control');
@@ -1042,6 +1071,19 @@ function init() {
     } else {
       starfield.classList.add('hidden');
     }
+  };
+  
+  document.getElementById('tooltip-toggle').onchange = (e) => {
+    tooltipsEnabled = e.target.checked;
+    if (!tooltipsEnabled) {
+      hoveredPoint = null;
+      tooltip.classList.remove('visible');
+    }
+  };
+
+  document.getElementById('grid-toggle').onchange = (e) => {
+    showGrid = e.target.checked;
+    draw();
   };
 
   draw();
@@ -1155,8 +1197,10 @@ function draw() {
      drawPosterior();
   }
 
-  // Draw coordinate grid
-  drawCoordinateGrid();
+  // Draw cached coordinate grid
+  if (showGrid) {
+    ctx.drawImage(gridCanvas, 0, 0, WIDTH, HEIGHT);
+  }
 
   // Draw map boundary ellipse
   ctx.strokeStyle = '#334155';
@@ -1167,57 +1211,84 @@ function draw() {
   ctx.ellipse(WIDTH/2, HEIGHT/2, rx, ry, 0, 0, 2*PI);
   ctx.stroke();
   
-  const visible = getVisiblePoints();
+  const allVisible = getVisiblePoints();
+  const unselectedGalaxies = [];
+  const selectedGalaxies = [];
   
-  // Unselected galaxies with subtle glow
-  ctx.save();
-  ctx.shadowColor = 'rgba(148, 163, 184, 0.4)';
-  ctx.shadowBlur = 3;
-  ctx.fillStyle = '#94a3b8';
-  ctx.globalAlpha = 0.6;
-  ctx.beginPath();
-  visible.forEach(d => {
-    if (!selectedIds.has(d.id) && d.type !== 'Pulsar' && d !== hoveredPoint) {
-       ctx.moveTo(d.px, d.py);
-       ctx.arc(d.px, d.py, 1.5, 0, 2*PI);
+  allVisible.forEach(d => {
+    if (d.type === 'Pulsar') return;
+    if (d === hoveredPoint) return;
+    if (selectedIds.has(d.id)) {
+      selectedGalaxies.push(d);
+    } else {
+      unselectedGalaxies.push(d);
     }
+  });
+  
+  // Unselected galaxies - optimized core+aura passes
+  ctx.save();
+  ctx.fillStyle = '#94a3b8';
+  ctx.globalAlpha = 0.35; // Soft aura
+  ctx.beginPath();
+  unselectedGalaxies.forEach(d => {
+       ctx.moveTo(d.px, d.py);
+       ctx.arc(d.px, d.py, 2.0, 0, 2*PI);
+  });
+  ctx.fill();
+  
+  ctx.globalAlpha = 0.8; // Sharp core
+  ctx.beginPath();
+  unselectedGalaxies.forEach(d => {
+       ctx.moveTo(d.px, d.py);
+       ctx.arc(d.px, d.py, 0.8, 0, 2*PI);
   });
   ctx.fill();
   ctx.restore();
   
-  // Selected galaxies with cyan glow
-  if (selectedIds.size > 0) {
+  // Selected galaxies with streamlined triple-layer glow
+  if (selectedGalaxies.length > 0) {
     ctx.save();
+    
+    // Level 1: Outer cyan bloom (Low alpha, large radius)
     ctx.shadowColor = 'rgba(34, 211, 238, 0.6)';
-    ctx.shadowBlur = 8;
-    ctx.fillStyle = '#22d3ee';
-    ctx.globalAlpha = 1.0;
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = 'rgba(34, 211, 238, 0.3)';
     ctx.beginPath();
-    visible.forEach(d => {
-        if (selectedIds.has(d.id) && d.type !== 'Pulsar') {
-            ctx.moveTo(d.px, d.py);
-            ctx.arc(d.px, d.py, 2.5, 0, 2*PI);
-        }
+    selectedGalaxies.forEach(d => {
+        ctx.moveTo(d.px, d.py);
+        ctx.arc(d.px, d.py, 5, 0, 2*PI);
     });
     ctx.fill();
+
+    // Level 2 & 3: Consolidated Mid-glow and core
+    // We can do this in one path with shadow for the mid-glow
+    ctx.shadowColor = 'rgba(34, 211, 238, 0.9)';
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = '#ffffff'; // White core with blue shadow makes it look like cyan glowing point
+    ctx.beginPath();
+    selectedGalaxies.forEach(d => {
+        ctx.moveTo(d.px, d.py);
+        ctx.arc(d.px, d.py, 2.0, 0, 2*PI);
+    });
+    ctx.fill();
+    
     ctx.restore();
   }
   
   // Highlight hovered point
   if (hoveredPoint && hoveredPoint.type !== 'Pulsar') {
     ctx.save();
-    ctx.shadowColor = 'rgba(244, 114, 182, 0.8)';
-    ctx.shadowBlur = 12;
+    ctx.shadowColor = 'rgba(244, 114, 182, 0.9)';
+    ctx.shadowBlur = 15;
     ctx.fillStyle = '#f472b6';
-    ctx.globalAlpha = 1.0;
     ctx.beginPath();
-    ctx.arc(hoveredPoint.px, hoveredPoint.py, 4, 0, 2*PI);
+    ctx.arc(hoveredPoint.px, hoveredPoint.py, 4.5, 0, 2*PI);
     ctx.fill();
     
     // Pulsing ring around hovered point
     const pulse = 0.5 + 0.5 * Math.sin(animationTime * 0.005);
-    ctx.strokeStyle = 'rgba(244, 114, 182, ' + (0.3 + pulse * 0.4) + ')';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(244, 114, 182, ' + (0.4 + pulse * 0.4) + ')';
+    ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(hoveredPoint.px, hoveredPoint.py, 8 + pulse * 4, 0, 2*PI);
     ctx.stroke();
@@ -1227,37 +1298,57 @@ function draw() {
   if (clickedId) {
       const d = projectedData.find(x => x.id === clickedId);
       if (d) {
-          ctx.beginPath();
+          ctx.save();
+          const pulse = 0.5 + 0.5 * Math.sin(animationTime * 0.01);
           ctx.strokeStyle = '#f472b6'; 
           ctx.lineWidth = 2;
-          ctx.arc(d.px, d.py, 6, 0, 2*PI);
+          ctx.shadowColor = '#f472b6';
+          ctx.shadowBlur = 10;
+          ctx.beginPath();
+          ctx.arc(d.px, d.py, 6 + pulse * 2, 0, 2*PI);
           ctx.stroke();
+          
+          ctx.globalAlpha = 0.4;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.arc(d.px, d.py, 12 + pulse * 4, 0, 2*PI);
+          ctx.stroke();
+          ctx.restore();
       }
   }
   
-  // Pulsars with glow
+  // Pulsars with high-intensity layered glow
   if (showPulsars) {
-      const pulsars = projectedData.filter(d => d.type === 'Pulsar');
-      pulsars.forEach(p => {
+      pulsarPoints.forEach(p => {
          const period = p.p0 * periodScale; 
          const phase = (animationTime % period) / period; 
          const brightness = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(phase * 2 * PI)); 
          
          ctx.save();
-         ctx.shadowColor = 'rgba(234, 179, 8, ' + (brightness * 0.8) + ')';
-         ctx.shadowBlur = 10 * brightness;
+         // Level 1: Outer soft glow
+         ctx.shadowColor = 'rgba(234, 179, 8, ' + (brightness * 0.4) + ')';
+         ctx.shadowBlur = 15 * brightness;
          ctx.globalAlpha = brightness;
          ctx.fillStyle = '#eab308';
          const sz = selectedIds.has(p.id) ? 6 : 4;
          
-         // Extra highlight for hovered pulsar
-         if (p === hoveredPoint) {
+         if (p.id === clickedId) {
            ctx.shadowColor = 'rgba(244, 114, 182, 0.9)';
+           ctx.shadowBlur = 20;
+           ctx.fillStyle = '#f472b6';
+         } else if (p === hoveredPoint) {
+           ctx.shadowColor = 'rgba(244, 114, 182, 0.7)';
            ctx.shadowBlur = 15;
            ctx.fillStyle = '#f472b6';
          }
          
          drawStar(ctx, p.px, p.py, 5, sz, sz/2);
+         
+         // Level 2: Inner tight core glow
+         ctx.shadowColor = (p.id === clickedId || p === hoveredPoint) ? 'white' : 'rgba(255, 255, 255, ' + (brightness * 0.8) + ')';
+         ctx.shadowBlur = 4 * brightness;
+         drawStar(ctx, p.px, p.py, 5, sz, sz/2);
+         
          ctx.restore();
       });
       ctx.globalAlpha = 1.0;
@@ -1288,67 +1379,87 @@ function draw() {
   }
 }
 
-// Draw coordinate grid lines
-function drawCoordinateGrid() {
-  ctx.save();
-  ctx.strokeStyle = 'rgba(71, 85, 105, 0.3)';
-  ctx.lineWidth = 0.5;
-  ctx.setLineDash([3, 6]);
+// Draw coordinate grid lines to a specific context (usually offscreen)
+function drawCoordinateGrid(g) {
+  g.clearRect(0, 0, WIDTH, HEIGHT);
+  g.save();
+  g.strokeStyle = 'rgba(71, 85, 105, 0.25)';
+  g.lineWidth = 0.5;
+  g.setLineDash([2, 4]);
   
   // RA lines (every 30 degrees = 2 hours)
   for (let ra = 0; ra < 360; ra += 30) {
-    ctx.beginPath();
+    g.beginPath();
     let started = false;
     for (let dec = -90; dec <= 90; dec += 2) {
       const p = projectMollweide(ra, dec);
       if (!started) {
-        ctx.moveTo(p.x, p.y);
+        g.moveTo(p.x, p.y);
         started = true;
       } else {
-        ctx.lineTo(p.x, p.y);
+        g.lineTo(p.x, p.y);
       }
     }
-    ctx.stroke();
+    g.stroke();
   }
   
   // Dec lines (every 30 degrees)
   for (let dec = -60; dec <= 60; dec += 30) {
-    ctx.beginPath();
+    if (dec === 0) continue; 
+    g.beginPath();
     let started = false;
     for (let ra = 0; ra <= 360; ra += 2) {
       const p = projectMollweide(ra, dec);
       if (!started) {
-        ctx.moveTo(p.x, p.y);
+        g.moveTo(p.x, p.y);
         started = true;
       } else {
-        ctx.lineTo(p.x, p.y);
+        g.lineTo(p.x, p.y);
       }
     }
-    ctx.stroke();
+    g.stroke();
   }
+  
+  // Equator
+  g.strokeStyle = 'rgba(71, 85, 105, 0.4)';
+  g.setLineDash([]);
+  g.beginPath();
+  for (let ra = 0; ra <= 360; ra += 2) {
+    const p = projectMollweide(ra, 0);
+    if (ra === 0) g.moveTo(p.x, p.y); else g.lineTo(p.x, p.y);
+  }
+  g.stroke();
   
   // Draw grid labels
-  ctx.setLineDash([]);
-  ctx.font = '9px Inter, sans-serif';
-  ctx.fillStyle = 'rgba(100, 116, 139, 0.6)';
-  ctx.textAlign = 'center';
+  g.save();
+  g.font = '500 10px Inter, sans-serif';
+  g.fillStyle = 'rgba(148, 163, 184, 0.8)';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.shadowColor = 'rgba(0, 0, 0, 0.5)';
+  g.shadowBlur = 3;
   
-  // RA labels at dec=0
-  for (let ra = 0; ra < 360; ra += 60) {
-    const p = projectMollweide(ra, 0);
-    const hours = Math.floor(ra / 15);
-    ctx.fillText(hours + 'h', p.x, p.y + 12);
-  }
+  // RA labels at dec=0 and dec=±45 for better distribution
+  [0, 45, -45].forEach(dLabel => {
+    for (let ra = 0; ra < 360; ra += 60) {
+      const p = projectMollweide(ra, dLabel);
+      const hours = Math.floor(ra / 15) + 'h';
+      g.fillText(hours, p.x, p.y + (dLabel === 0 ? 12 : (dLabel > 0 ? -12 : 12)));
+    }
+  });
+
+  // Dec labels along specific meridians (60°, 180°, 300°)
+  g.textAlign = 'left';
+  [60, 180, 300].forEach(raLabel => {
+    for (let dec = -60; dec <= 60; dec += 30) {
+      if (dec === 0) continue;
+      const p = projectMollweide(raLabel, dec);
+      g.fillText((dec > 0 ? '+' : '') + dec + '°', p.x + 5, p.y);
+    }
+  });
+  g.restore();
   
-  // Dec labels at ra=180
-  for (let dec = -60; dec <= 60; dec += 30) {
-    if (dec === 0) continue;
-    const p = projectMollweide(180, dec);
-    ctx.textAlign = 'left';
-    ctx.fillText((dec > 0 ? '+' : '') + dec + '°', p.x + 5, p.y + 3);
-  }
-  
-  ctx.restore();
+  g.restore();
 }
 
 function drawPosterior() {
@@ -1510,8 +1621,8 @@ function handleMove(e) {
    const y = e.clientY - rect.top;
    mousePos = {x, y};
    
-   // Hover detection for tooltip
-   if (!isDrawing) {
+   // Hover detection for tooltip (only if enabled)
+   if (!isDrawing && tooltipsEnabled) {
      const nearbyPoints = queryGrid(x, y, 15);
      let closest = null;
      let closestDist = Infinity;
@@ -1531,6 +1642,9 @@ function handleMove(e) {
        // Update position even if same point
        positionTooltip(e.clientX, e.clientY);
      }
+   } else if (!isDrawing && !tooltipsEnabled && hoveredPoint) {
+     hoveredPoint = null;
+     tooltip.classList.remove('visible');
    }
    
    if (mode === 'magnify') {
@@ -1623,6 +1737,33 @@ canvas.addEventListener('dblclick', () => {
 });
 
 function closeSelection() {
+    if (lassoPoints.length < 5) {
+        // Try single point selection
+        const p = lassoPoints[0];
+        const nearby = queryGrid(p.x, p.y, 15);
+        let closest = null;
+        let minD = 225; // 15^2
+        nearby.forEach(d => {
+            const distSq = (d.px - p.x)**2 + (d.py - p.y)**2;
+            if (distSq < minD) { minD = distSq; closest = d; }
+        });
+        if (closest) {
+            clickedId = closest.id;
+            selectedIds.clear();
+            selectedIds.add(closest.id);
+            showInspector([closest]);
+        } else {
+            selectedIds.clear();
+            clickedId = null;
+            inspector.style.display = 'none';
+        }
+        lassoPoints = [];
+        draw();
+        drawHistograms();
+        updateStats();
+        return;
+    }
+
     const vs = lassoPoints.map(p => [p.x, p.y]);
     projectedData.forEach(d => {
         if (!showPulsars && d.type === 'Pulsar') return;
@@ -1636,6 +1777,25 @@ function closeSelection() {
         }
         if (inside) selectedIds.add(d.id);
     });
+    
+    // Auto-inspect if only one point in selection
+    if (selectedIds.size === 1) {
+      const id = Array.from(selectedIds)[0];
+      const point = projectedData.find(d => d.id === id);
+      if (point) {
+        clickedId = id;
+        showInspector([point]);
+      }
+    } else {
+      clickedId = null;
+      if (selectedIds.size > 0) {
+        const selPoints = projectedData.filter(d => selectedIds.has(d.id));
+        showInspector(selPoints.slice(0, 50));
+      } else {
+        inspector.style.display = 'none';
+      }
+    }
+
     draw();
     drawHistograms();
     updateStats();
