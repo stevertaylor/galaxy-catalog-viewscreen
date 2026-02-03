@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet">
+  <style>
+{{ STYLE_CSS }}
+  </style>
+</head>
+
+<body>
+
+  <div class="container">
+    <div class="controls">
+      <div
+        style="font-size: 18px; font-weight: 700; color: #22d3ee; letter-spacing: -0.02em; text-shadow: 0 0 20px rgba(34, 211, 238, 0.3);">
+        GALAXY VIEWSCREEN</div>
+      <div style="font-size: 9px; color: #94a3b8; margin-bottom: 20px;">2MRS Catalog &amp; NANOGrav Pulsars</div>
+
+      <div style="font-size: 11px; font-weight: bold; margin-bottom: 15px; color: #f8fafc;">DATA SOURCES</div>
+
+      <div class="file-input-group">
+        <label class="file-input-label">Galaxy Catalog (.txt)</label>
+        <input type="file" id="upload-galaxies" accept=".txt,.dat">
+        <div class="progress-container" id="progress-galaxies">
+          <div class="progress-bar" id="progress-bar-galaxies"></div>
+        </div>
+        <div id="status-galaxies" class="status-text">Using synthetic data</div>
+      </div>
+
+      <div class="file-input-group">
+        <label class="file-input-label">MCMC Chain (.txt)</label>
+        <input type="file" id="upload-chain" accept=".txt,.dat">
+        <div class="progress-container" id="progress-chain">
+          <div class="progress-bar" id="progress-bar-chain"></div>
+        </div>
+        <div id="status-chain" class="status-text"></div>
+      </div>
+
+      <!-- Search Box -->
+      <div class="file-input-group" style="margin-top: 10px;">
+        <label class="file-input-label">Search Galaxy ID</label>
+        <div style="display: flex; gap: 6px;">
+          <input type="text" id="search-input" placeholder="e.g. mock-0"
+            style="flex: 1; font-size: 11px; padding: 8px; background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(71, 85, 105, 0.4); border-radius: 8px; color: #e2e8f0; font-family: inherit; outline: none;">
+          <button id="btn-search" style="flex: 0 0 60px; padding: 8px;">Find</button>
+        </div>
+      </div>
+
+      <!-- Selection Tools -->
+      <div class="section-header">Selection Tools</div>
+
+      <div class="btn-group">
+        <button id="btn-lasso" class="active">Lasso</button>
+        <button id="btn-poly">Polygon</button>
+        <button id="btn-magnify">Magnify</button>
+        <button id="btn-posterior" disabled>Posterior</button>
+        <button id="btn-export" title="Export Selection">📥</button>
+        <button id="trash-btn" class="trash-btn" title="Clear Selection">🗑️</button>
+      </div>
+
+      <!-- Statistics -->
+      <div class="stats-box">
+        <div class="stat-row"><span class="stat-label">TOTAL SOURCES</span> <span class="stat-val"
+            id="count-total">0</span></div>
+        <div class="stat-row"><span class="stat-label">SELECTED</span> <span class="stat-val" id="count-sel">0</span>
+        </div>
+      </div>
+
+      <!-- Distributions -->
+      <div class="section-header">Distributions</div>
+
+      <div class="hist-label distance">Distance (Mpc)</div>
+      <canvas id="hist-dist" width="280" height="85" style="margin-bottom: 16px; border-radius: 6px;"></canvas>
+
+      <div class="hist-label mass">log₁₀(M_SMBH / M_☉)</div>
+      <canvas id="hist-mass" width="280" height="85" style="border-radius: 6px;"></canvas>
+
+      <!-- Filters -->
+      <div class="section-header" style="margin-top: 20px;">Filters</div>
+
+      <div class="slider-control">
+        <div class="slider-header">
+          <span>DIST RANGE (Mpc)</span> <span class="slider-value" id="dist-range-val">0 - 500</span>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <input type="range" id="filter-dist-min" min="0" max="500" step="1" value="0" style="flex: 1;">
+          <input type="range" id="filter-dist-max" min="0" max="500" step="1" value="500" style="flex: 1;">
+        </div>
+      </div>
+
+      <div class="slider-control" style="margin-top: 8px;">
+        <div class="slider-header">
+          <span>MASS RANGE (log₁₀)</span> <span class="slider-value" id="mass-range-val">6.0 - 10.5</span>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <input type="range" id="filter-mass-min" min="6" max="10.5" step="0.1" value="6.0" style="flex: 1;">
+          <input type="range" id="filter-mass-max" min="6" max="10.5" step="0.1" value="10.5" style="flex: 1;">
+        </div>
+      </div>
+
+      <!-- Pulsar Legend -->
+      <div class="legend" id="pulsar-toggle">
+        <span>★ NANOGrav 15-yr Dataset Pulsars</span>
+      </div>
+
+      <!-- Twinkle Slider -->
+      <div class="slider-control">
+        <div class="slider-header">
+          <span>PULSE DILATION</span> <span class="slider-value" id="twinkle-val">400×</span>
+        </div>
+        <input type="range" id="twinkle-slider" min="10" max="500" step="10" value="400">
+      </div>
+
+      <!-- Posterior Control -->
+      <div id="posterior-control" class="slider-control" style="display: none;">
+        <div class="slider-header">
+          <span>CREDIBLE REGION</span> <span class="slider-value" id="cred-val">95%</span>
+        </div>
+        <input type="range" id="cred-slider" min="0.1" max="0.99" step="0.01" value="0.95">
+      </div>
+
+      <!-- Background Toggles -->
+      <div class="slider-control" style="margin-top: 8px;">
+        <div
+          style="display: flex; align-items: center; gap: 10px; font-size: 11px; font-weight: 500; color: #94a3b8; margin-bottom: 12px;">
+          <span>Coordinate System</span>
+          <select id="coord-system"
+            style="flex: 1; padding: 6px 8px; background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(71, 85, 105, 0.5); border-radius: 6px; color: #e2e8f0; font-size: 11px; font-family: inherit; cursor: pointer;">
+            <option value="equatorial">Equatorial (RA/Dec)</option>
+            <option value="galactic">Galactic (l/b)</option>
+          </select>
+        </div>
+        <label
+          style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8; margin-bottom: 8px;">
+          <input type="checkbox" id="grid-toggle" checked style="width: 16px; height: 16px; accent-color: #94a3b8;">
+          <span>Coordinate Grid Overlay</span>
+        </label>
+        <label
+          style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8; margin-bottom: 8px;">
+          <input type="checkbox" id="milkyway-toggle" checked style="width: 16px; height: 16px; accent-color: #a855f7;">
+          <span>Milky Way Background</span>
+        </label>
+        <label
+          style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8; margin-bottom: 8px;">
+          <input type="checkbox" id="starfield-toggle" checked
+            style="width: 16px; height: 16px; accent-color: #22d3ee;">
+          <span>Starfield Animation</span>
+        </label>
+        <label
+          style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 11px; font-weight: 500; color: #94a3b8;">
+          <input type="checkbox" id="tooltip-toggle" checked style="width: 16px; height: 16px; accent-color: #10b981;">
+          <span>Hover Tooltips</span>
+        </label>
+      </div>
+
+      <!-- Credits -->
+      <div
+        style="margin-top: auto; padding-top: 16px; border-top: 1px solid rgba(71, 85, 105, 0.3); font-size: 9px; color: #64748b; line-height: 1.5;">
+        <div style="font-weight: 600; margin-bottom: 4px; color: #94a3b8;">DEVELOPED BY</div>
+        <div>Polina Petrov, Celine Mang, Stephen Taylor</div>
+        <div style="margin-top: 6px;">Participants of the 2024 VIPER Summer School</div>
+        <div style="margin-top: 8px; font-size: 8px; color: #475569;">Supported by NSF Award #2307719</div>
+      </div>
+    </div>
+
+    <div class="viewscreen" id="map-container">
+      <!-- Milky Way Background -->
+      <div class="milkyway-bg" id="milkyway"></div>
+      <!-- Starfield Animation -->
+      <div class="starfield" id="starfield" style="z-index: 1;">
+        <div class="stars-layer"></div>
+        <div class="stars-layer layer-2"></div>
+        <div class="stars-layer layer-3"></div>
+      </div>
+      <canvas id="main-canvas" style="position: relative; z-index: 1;"></canvas>
+      <div class="inspector" id="inspector">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Data</th>
+              <th>Pos</th>
+            </tr>
+          </thead>
+          <tbody id="inspector-body"></tbody>
+        </table>
+      </div>
+      <!-- Hover Tooltip -->
+      <div class="tooltip" id="tooltip">
+        <div class="tooltip-id" id="tooltip-id"></div>
+        <div class="tooltip-row"><span class="tooltip-label" id="tooltip-coord1-label">RA</span><span
+            class="tooltip-value" id="tooltip-coord1"></span></div>
+        <div class="tooltip-row"><span class="tooltip-label" id="tooltip-coord2-label">Dec</span><span
+            class="tooltip-value" id="tooltip-coord2"></span></div>
+        <div class="tooltip-row" id="tooltip-dist-row"><span class="tooltip-label">Dist</span><span
+            class="tooltip-value" id="tooltip-dist"></span></div>
+        <div class="tooltip-row" id="tooltip-mass-row"><span class="tooltip-label">Mass</span><span
+            class="tooltip-value" id="tooltip-mass"></span></div>
+        <div class="tooltip-type" id="tooltip-type"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.galaxyAppData = {
+      pulsars: {{ PULSARS_JSON }},
+      galaxies: {{ GALAXIES_JSON }}
+    };
+  </script>
+  <script>
+{{ SCRIPT_JS }}
+  </script>
+</body>
+
+</html>
