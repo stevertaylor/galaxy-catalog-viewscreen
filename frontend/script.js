@@ -5,6 +5,7 @@ let rawData = [];
 let posteriorSamples = [];
 let projectedData = [];
 let pulsarPoints = [];
+let healpixMap = null; // {nside, npix, probs: Float64Array, pixels: [{ipix, ra, dec, prob}]}
 
 // --- UTILS ---
 function setupHighDPI(canv, w, h) {
@@ -108,72 +109,288 @@ async function handleGalaxyUpload(e) {
     }
 }
 
-async function handleChainUpload(e) {
+/**
+ * Parse a NumPy .npy file from an ArrayBuffer.
+ * Returns a Float64Array (or Float32Array) of the flat data.
+ */
+function parseNpyFile(buffer) {
+    const bytes = new Uint8Array(buffer);
+    // Validate magic: \x93NUMPY
+    if (bytes[0] !== 0x93 || bytes[1] !== 0x4E || bytes[2] !== 0x55 ||
+        bytes[3] !== 0x4D || bytes[4] !== 0x50 || bytes[5] !== 0x59) {
+        throw new Error('Not a valid .npy file');
+    }
+    const majorVersion = bytes[6];
+    let headerLen;
+    let headerOffset;
+    if (majorVersion === 1) {
+        headerLen = bytes[8] | (bytes[9] << 8);
+        headerOffset = 10;
+    } else {
+        headerLen = bytes[8] | (bytes[9] << 8) | (bytes[10] << 16) | (bytes[11] << 24);
+        headerOffset = 12;
+    }
+    const headerStr = new TextDecoder().decode(bytes.slice(headerOffset, headerOffset + headerLen));
+    const dataOffset = headerOffset + headerLen;
+
+    // Parse dtype from header string like "{'descr': '<f8', 'fortran_order': False, 'shape': (3072,), }"
+    const descrMatch = headerStr.match(/'descr'\s*:\s*'([^']+)'/);
+    if (!descrMatch) throw new Error('Cannot parse dtype from .npy header');
+    const descr = descrMatch[1];
+
+    const dataBytes = buffer.slice(dataOffset);
+    if (descr === '<f8' || descr === '=f8' || descr === 'float64') {
+        return new Float64Array(dataBytes);
+    } else if (descr === '<f4' || descr === '=f4' || descr === 'float32') {
+        return new Float32Array(dataBytes);
+    } else if (descr === '>f8') {
+        // Big-endian float64 — need to byte-swap
+        const view = new DataView(dataBytes);
+        const arr = new Float64Array(dataBytes.byteLength / 8);
+        for (let i = 0; i < arr.length; i++) {
+            arr[i] = view.getFloat64(i * 8, false); // big-endian
+        }
+        return arr;
+    } else if (descr === '>f4') {
+        const view = new DataView(dataBytes);
+        const arr = new Float32Array(dataBytes.byteLength / 4);
+        for (let i = 0; i < arr.length; i++) {
+            arr[i] = view.getFloat32(i * 4, false);
+        }
+        return arr;
+    } else {
+        throw new Error(`Unsupported .npy dtype: ${descr}`);
+    }
+}
+
+/**
+ * Build a healpixMap from a flat probability array (from .npy data).
+ * This is the same logic as loadHealpixData but works from raw float data.
+ */
+function activateHealpixFromArray(data) {
+    const npix = data.length;
+    const nside = Math.round(Math.sqrt(npix / 12));
+    if (12 * nside * nside !== npix) {
+        throw new Error(`Invalid HEALPix map: ${npix} pixels (not 12*nside^2)`);
+    }
+
+    const probs = new Float64Array(npix);
+    const pixels = [];
+    for (let ipix = 0; ipix < npix; ipix++) {
+        probs[ipix] = data[ipix];
+        if (data[ipix] > 0) {
+            // Convert pixel index to RA/Dec using ang2pixRing inverse
+            // We need theta, phi from pixel index — use the backend-provided data if available,
+            // otherwise compute from the JS healpix_pix2ang equivalent
+            const theta_phi = healpixPix2angRing(nside, ipix);
+            const dec = 90.0 - theta_phi[0] * 180 / Math.PI;
+            const ra = theta_phi[1] * 180 / Math.PI;
+            pixels.push({
+                ipix: ipix,
+                ra: Math.round(ra * 10000) / 10000,
+                dec: Math.round(dec * 10000) / 10000,
+                prob: data[ipix]
+            });
+        }
+    }
+
+    // Pre-sort probabilities (descending) and compute cumulative sum
+    const indexedProbs = [];
+    for (let i = 0; i < npix; i++) {
+        if (probs[i] > 0) indexedProbs.push({ ipix: i, prob: probs[i] });
+    }
+    indexedProbs.sort((a, b) => b.prob - a.prob);
+    let cumsum = 0;
+    const sortedWithCumsum = indexedProbs.map(p => {
+        cumsum += p.prob;
+        return { ...p, cumsum };
+    });
+
+    healpixMap = { nside, npix, probs, pixels, sorted: sortedWithCumsum };
+
+    // Clear any MCMC posterior since HEALPix takes priority
+    posteriorSamples = [];
+    posteriorMap = null;
+
+    btnPosterior.disabled = false;
+}
+
+/**
+ * Convert HEALPix RING pixel index to (theta, phi) in radians.
+ * Pure JS implementation for client-side .npy parsing.
+ */
+function healpixPix2angRing(nside, ipix) {
+    const npix = 12 * nside * nside;
+    const ncap = 2 * nside * (nside - 1); // pixels in north polar cap
+
+    if (ipix < ncap) {
+        // North polar cap
+        const ph = (ipix + 1) / 2.0;
+        const i_ring = Math.floor(Math.sqrt(ph - Math.sqrt(Math.floor(ph)))) + 1;
+        // Recompute carefully
+        let ir = 0;
+        let s = 0;
+        while (s + 4 * (ir + 1) < ipix + 1) {
+            s += 4 * (ir + 1);
+            ir++;
+        }
+        ir += 1; // 1-indexed
+        const j = ipix + 1 - 2 * ir * (ir - 1);
+        const theta = Math.acos(1 - ir * ir / (3.0 * nside * nside));
+        const phi = (j - 0.5) * Math.PI / (2 * ir);
+        return [theta, phi];
+    } else if (ipix < npix - ncap) {
+        // Equatorial belt
+        const ip = ipix - ncap;
+        const i_ring = Math.floor(ip / (4 * nside)) + nside;
+        const j = (ip % (4 * nside)) + 1;
+        const s = (i_ring - nside + 1) % 2;
+        const theta = Math.acos((2.0 * nside - i_ring) / (1.5 * nside));
+        const phi = (j - (1 + s) / 2.0) * Math.PI / (2 * nside);
+        return [theta, phi];
+    } else {
+        // South polar cap
+        const ip = npix - ipix;
+        let ir = 0;
+        let s = 0;
+        while (s + 4 * (ir + 1) < ip) {
+            s += 4 * (ir + 1);
+            ir++;
+        }
+        ir += 1;
+        const j = ip - 2 * ir * (ir - 1);
+        const theta = Math.acos(-1 + ir * ir / (3.0 * nside * nside));
+        const phi = (j - 0.5) * Math.PI / (2 * ir);
+        return [theta, phi];
+    }
+}
+
+/**
+ * Unified handler for posterior file upload.
+ * Detects .npy (HEALPix) vs .txt/.dat (MCMC chain) by extension.
+ */
+async function handlePosteriorUpload(e) {
     const file = e.target.files[0];
     if (!file) return;
 
-    const progressContainer = document.getElementById('progress-chain');
-    const progressBar = document.getElementById('progress-bar-chain');
-    const statusText = document.getElementById('status-chain');
+    const progressContainer = document.getElementById('progress-posterior');
+    const progressBar = document.getElementById('progress-bar-posterior');
+    const statusText = document.getElementById('status-posterior');
+
+    // Reset dropdown selection
+    document.getElementById('preloaded-skymap').value = '';
 
     // Show loading state
     progressContainer.classList.add('active');
     progressBar.style.width = '0%';
     statusText.innerText = 'Reading file...';
+    statusText.style.color = '';
     statusText.classList.add('loading');
 
     await new Promise(r => setTimeout(r, 10));
 
-    const text = await file.text();
-    progressBar.style.width = '20%';
-    statusText.innerText = 'Parsing samples...';
+    const ext = file.name.split('.').pop().toLowerCase();
 
-    await new Promise(r => setTimeout(r, 10));
+    if (ext === 'npy') {
+        // --- HEALPix .npy file ---
+        try {
+            progressBar.style.width = '30%';
+            statusText.innerText = 'Parsing .npy file...';
+            await new Promise(r => setTimeout(r, 10));
 
-    const lines = text.split(/\r?\n/);
-    const totalLines = lines.length;
-    const newSamples = [];
+            const buffer = await file.arrayBuffer();
+            progressBar.style.width = '60%';
+            statusText.innerText = 'Building HEALPix map...';
+            await new Promise(r => setTimeout(r, 10));
 
-    const chunkSize = 5000;
-    for (let i = 0; i < totalLines; i += chunkSize) {
-        const chunk = lines.slice(i, Math.min(i + chunkSize, totalLines));
-        chunk.forEach(line => {
-            line = line.trim();
-            if (!line || !(/^[0-9-]/.test(line))) return;
-            const parts = line.split(/[ ,\s]+/);
-            if (parts.length >= 2) {
-                const ra = parseFloat(parts[0]);
-                const dec = parseFloat(parts[1]);
-                if (!isNaN(ra) && !isNaN(dec)) newSamples.push({ ra, dec });
-            }
-        });
+            const data = parseNpyFile(buffer);
+            activateHealpixFromArray(data);
 
-        const progress = 20 + (Math.min(i + chunkSize, totalLines) / totalLines) * 50;
-        progressBar.style.width = progress + '%';
-        await new Promise(r => setTimeout(r, 0));
-    }
+            progressBar.style.width = '100%';
+            statusText.classList.remove('loading');
+            statusText.innerText = `Loaded HEALPix map (nside=${healpixMap.nside}, ${healpixMap.pixels.length} nonzero px)`;
+            draw();
 
-    if (newSamples.length > 0) {
-        progressBar.style.width = '80%';
-        statusText.innerText = 'Computing posterior...';
+            setTimeout(() => progressContainer.classList.remove('active'), 500);
+        } catch (err) {
+            progressContainer.classList.remove('active');
+            statusText.classList.remove('loading');
+            statusText.innerText = `Error: ${err.message}`;
+            statusText.style.color = '#f87171';
+        }
+    } else {
+        // --- MCMC chain .txt/.dat file ---
+        const text = await file.text();
+        progressBar.style.width = '20%';
+        statusText.innerText = 'Parsing MCMC samples...';
+
         await new Promise(r => setTimeout(r, 10));
 
-        posteriorSamples = newSamples;
-        computePosteriorMap();
+        const lines = text.split(/\r?\n/);
+        const totalLines = lines.length;
+        const newSamples = [];
 
-        progressBar.style.width = '100%';
-        btnPosterior.disabled = false;
-        statusText.classList.remove('loading');
-        statusText.innerText = `Loaded ${newSamples.length} MCMC samples`;
-        draw();
+        const chunkSize = 5000;
+        for (let i = 0; i < totalLines; i += chunkSize) {
+            const chunk = lines.slice(i, Math.min(i + chunkSize, totalLines));
+            chunk.forEach(line => {
+                line = line.trim();
+                if (!line || !(/^[0-9-]/.test(line))) return;
+                const parts = line.split(/[ ,\s]+/);
+                if (parts.length >= 2) {
+                    const ra = parseFloat(parts[0]);
+                    const dec = parseFloat(parts[1]);
+                    if (!isNaN(ra) && !isNaN(dec)) newSamples.push({ ra, dec });
+                }
+            });
 
-        setTimeout(() => progressContainer.classList.remove('active'), 500);
-    } else {
-        progressContainer.classList.remove('active');
-        statusText.classList.remove('loading');
-        statusText.innerText = 'No valid samples found';
-        statusText.style.color = '#f87171';
+            const progress = 20 + (Math.min(i + chunkSize, totalLines) / totalLines) * 50;
+            progressBar.style.width = progress + '%';
+            await new Promise(r => setTimeout(r, 0));
+        }
+
+        if (newSamples.length > 0) {
+            progressBar.style.width = '80%';
+            statusText.innerText = 'Computing posterior...';
+            await new Promise(r => setTimeout(r, 10));
+
+            // Clear any HEALPix map since MCMC is being loaded
+            healpixMap = null;
+            posteriorSamples = newSamples;
+            computePosteriorMap();
+
+            progressBar.style.width = '100%';
+            btnPosterior.disabled = false;
+            statusText.classList.remove('loading');
+            statusText.innerText = `Loaded ${newSamples.length} MCMC samples`;
+            draw();
+
+            setTimeout(() => progressContainer.classList.remove('active'), 500);
+        } else {
+            progressContainer.classList.remove('active');
+            statusText.classList.remove('loading');
+            statusText.innerText = 'No valid samples found';
+            statusText.style.color = '#f87171';
+        }
     }
+}
+
+/**
+ * Clear all posterior data (HEALPix and MCMC).
+ */
+function clearPosterior() {
+    healpixMap = null;
+    posteriorMap = null;
+    posteriorSamples = [];
+    btnPosterior.disabled = true;
+    if (mode === 'posterior') setMode('lasso');
+
+    const statusText = document.getElementById('status-posterior');
+    statusText.innerText = '';
+    statusText.style.color = '';
+    document.getElementById('preloaded-skymap').value = '';
+    document.getElementById('upload-posterior').value = '';
+    draw();
 }
 
 function refreshData() {
@@ -251,6 +468,7 @@ let showPulsars = true;
 let mousePos = { x: 0, y: 0 };
 let spatialGrid = {};
 let posteriorMap = null;
+let posteriorThresholdCache = null; // cached {sorted, cumsum} for the active posterior
 let credibleLevel = 0.95;
 let animationTime = 0;
 let periodScale = 400;
@@ -325,10 +543,15 @@ function init() {
     const statusText = document.getElementById('status-galaxies');
     if (statusText) statusText.innerText = 'Using synthetic data';
 
+    // Load pre-loaded HEALPix skymaps and populate dropdown
+    loadPreloadedSkymaps();
+
     refreshData();
 
     document.getElementById('upload-galaxies').addEventListener('change', handleGalaxyUpload);
-    document.getElementById('upload-chain').addEventListener('change', handleChainUpload);
+    document.getElementById('upload-posterior').addEventListener('change', handlePosteriorUpload);
+    document.getElementById('btn-clear-posterior').addEventListener('click', clearPosterior);
+    document.getElementById('preloaded-skymap').addEventListener('change', handlePreloadedSkymapSelect);
 
     canvas.addEventListener('mousedown', handleStart);
     canvas.addEventListener('mousemove', handleMove);
@@ -412,11 +635,15 @@ function init() {
         if (posteriorSamples.length > 0) {
             computePosteriorMap();
         }
+        // HEALPix map is in sky coords, no recomputation needed, just redraw
 
         const dpr = window.devicePixelRatio || 1;
         gridCtx.setTransform(1, 0, 0, 1, 0, 0);
         gridCtx.scale(dpr, dpr);
         drawCoordinateGrid(gridCtx);
+
+        // Clear stale lasso boundary — the selected IDs remain valid
+        lassoPoints = [];
 
         draw();
     };
@@ -591,11 +818,200 @@ function computePosteriorMap() {
     posteriorMap = { probs, sorted, cols, rows, res };
 }
 
+// --- HEALPIX SUPPORT ---
+
+// Store preloaded HEALPix maps from the backend
+let preloadedHealpixMaps = {};
+
+/**
+ * Load pre-loaded HEALPix skymaps from the backend and populate the dropdown.
+ */
+function loadPreloadedSkymaps() {
+    const hpxFiles = window.galaxyAppData?.healpixFiles;
+    if (!hpxFiles || typeof hpxFiles !== 'object') return;
+
+    preloadedHealpixMaps = hpxFiles;
+    const dropdown = document.getElementById('preloaded-skymap');
+
+    Object.keys(hpxFiles).forEach(fname => {
+        const opt = document.createElement('option');
+        opt.value = fname;
+        opt.textContent = fname;
+        dropdown.appendChild(opt);
+    });
+}
+
+/**
+ * Activate a pre-loaded HEALPix map from the backend-provided data.
+ * The data is already in {nside, npix, pixels: [{ipix, ra, dec, prob}]} format.
+ */
+function activatePreloadedHealpix(hpxData) {
+    if (!hpxData || !hpxData.nside || !hpxData.pixels || hpxData.pixels.length === 0) return;
+
+    const nside = hpxData.nside;
+    const npix = 12 * nside * nside;
+    const probs = new Float64Array(npix);
+
+    hpxData.pixels.forEach(p => {
+        probs[p.ipix] = p.prob;
+    });
+
+    const indexedProbs = [];
+    for (let i = 0; i < npix; i++) {
+        if (probs[i] > 0) indexedProbs.push({ ipix: i, prob: probs[i] });
+    }
+    indexedProbs.sort((a, b) => b.prob - a.prob);
+    let cumsum = 0;
+    const sortedWithCumsum = indexedProbs.map(p => {
+        cumsum += p.prob;
+        return { ...p, cumsum };
+    });
+
+    healpixMap = { nside, npix, probs, pixels: hpxData.pixels, sorted: sortedWithCumsum };
+
+    // Clear MCMC posterior
+    posteriorSamples = [];
+    posteriorMap = null;
+
+    btnPosterior.disabled = false;
+}
+
+/**
+ * Handle selection from the pre-loaded skymap dropdown.
+ */
+function handlePreloadedSkymapSelect(e) {
+    const fname = e.target.value;
+    const statusText = document.getElementById('status-posterior');
+    document.getElementById('upload-posterior').value = '';
+
+    if (!fname) {
+        // "Select a skymap" chosen — do nothing
+        return;
+    }
+
+    const hpxData = preloadedHealpixMaps[fname];
+    if (!hpxData) {
+        statusText.innerText = `Map not found: ${fname}`;
+        statusText.style.color = '#f87171';
+        return;
+    }
+
+    activatePreloadedHealpix(hpxData);
+    statusText.innerText = `Loaded ${fname} (nside=${healpixMap.nside}, ${healpixMap.pixels.length} px)`;
+    statusText.style.color = '';
+    draw();
+}
+
+/**
+ * Convert (theta, phi) in radians to HEALPix RING pixel index.
+ * theta = colatitude [0, pi], phi = longitude [0, 2*pi].
+ * Pure JS implementation, no healpy needed.
+ */
+function ang2pixRing(nside, theta, phi) {
+    const npix = 12 * nside * nside;
+    const z = Math.cos(theta);
+    const za = Math.abs(z);
+    const tt = ((phi % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI) / (Math.PI / 2); // in [0,4)
+
+    if (za <= 2.0 / 3.0) {
+        // Equatorial belt
+        const nl4 = 4 * nside;
+        const temp1 = nside * (0.5 + tt);
+        const temp2 = nside * z * 0.75;
+
+        const jp = Math.floor(temp1 - temp2); // ascending phi
+        const jm = Math.floor(temp1 + temp2); // descending phi
+
+        const ir = nside + 1 + jp - jm; // ring number in [1, 2*nside+1]
+        const kshift = 1 - (ir & 1); // kshift=1 if ir is even
+
+        const ip = Math.floor((jp + jm - nside + kshift + 1) / 2); // pixel index in ring
+        const ipMod = ((ip % nl4) + nl4) % nl4;
+
+        return Math.floor(2 * nside * (nside - 1) + (ir - 1) * nl4 + ipMod);
+    } else {
+        const tp = tt - Math.floor(tt);
+        const tmp = nside * Math.sqrt(3 * (1 - za));
+
+        const jp = Math.floor(tp * tmp); // increasing phi
+        const jm = Math.floor((1.0 - tp) * tmp); // decreasing phi
+
+        const ir = jp + jm + 1; // ring number
+        const ip = Math.floor(tt * ir); // pixel index in ring
+        const ipMod = ((ip % (4 * ir)) + 4 * ir) % (4 * ir);
+
+        if (z > 0) {
+            return Math.floor(2 * ir * (ir - 1) + ipMod);
+        } else {
+            return Math.floor(npix - 2 * ir * (ir + 1) + ipMod);
+        }
+    }
+}
+
+/**
+ * Get the HEALPix pixel probability for a given (RA, Dec) in degrees.
+ * RA and Dec are always in equatorial coordinates (matching the map).
+ */
+function getHealpixProb(ra, dec) {
+    if (!healpixMap) return 0;
+    const theta = (90 - dec) * Math.PI / 180; // colatitude
+    const phi = ra * Math.PI / 180; // longitude
+    const ipix = ang2pixRing(healpixMap.nside, theta, phi);
+    return healpixMap.probs[ipix] || 0;
+}
+
+/**
+ * Get the credible region threshold for a given credible level.
+ * Returns the minimum probability a pixel must have to be inside the region.
+ */
+function getCredibleThreshold(credLevel) {
+    if (!healpixMap || !healpixMap.sorted || healpixMap.sorted.length === 0) return 0;
+    // Find the pixel where cumulative sum first exceeds the credible level
+    for (const entry of healpixMap.sorted) {
+        if (entry.cumsum >= credLevel) {
+            return entry.prob;
+        }
+    }
+    return 0; // include everything
+}
+
+/**
+ * Viridis-inspired colormap for density visualization.
+ * t in [0, 1] -> {r, g, b} in [0, 255]
+ */
+function viridisColor(t) {
+    // Simplified viridis: dark purple -> blue -> teal -> green -> yellow
+    t = Math.max(0, Math.min(1, t));
+    let r, g, b;
+    if (t < 0.25) {
+        const s = t / 0.25;
+        r = Math.round(68 + s * (49 - 68));
+        g = Math.round(1 + s * (104 - 1));
+        b = Math.round(84 + s * (142 - 84));
+    } else if (t < 0.5) {
+        const s = (t - 0.25) / 0.25;
+        r = Math.round(49 + s * (53 - 49));
+        g = Math.round(104 + s * (183 - 104));
+        b = Math.round(142 + s * (121 - 142));
+    } else if (t < 0.75) {
+        const s = (t - 0.5) / 0.25;
+        r = Math.round(53 + s * (180 - 53));
+        g = Math.round(183 + s * (222 - 183));
+        b = Math.round(121 + s * (44 - 121));
+    } else {
+        const s = (t - 0.75) / 0.25;
+        r = Math.round(180 + s * (253 - 180));
+        g = Math.round(222 + s * (231 - 222));
+        b = Math.round(44 + s * (37 - 44));
+    }
+    return { r, g, b };
+}
+
 // --- DRAWING ---
 function draw() {
     ctx.clearRect(0, 0, WIDTH, HEIGHT);
 
-    if (mode === 'posterior' && posteriorMap) {
+    if (mode === 'posterior' && (posteriorMap || healpixMap)) {
         drawPosterior();
     }
 
@@ -866,6 +1282,12 @@ function drawCoordinateGrid(g) {
 }
 
 function drawPosterior() {
+    if (healpixMap) {
+        drawPosteriorHealpix();
+        return;
+    }
+    // Fallback: MCMC screen-space posterior
+    if (!posteriorMap) return;
     const { probs, sorted, cols, rows, res } = posteriorMap;
     let sum = 0;
     let thresh = 0;
@@ -882,6 +1304,87 @@ function drawPosterior() {
             }
         }
     }
+}
+
+function drawPosteriorHealpix() {
+    if (!healpixMap) return;
+    const thresh = getCredibleThreshold(credibleLevel);
+    const maxProb = healpixMap.sorted[0]?.prob || 1;
+
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+
+    // Draw each nonzero HEALPix pixel as a small filled region
+    healpixMap.pixels.forEach(px => {
+        if (px.prob < thresh) return; // outside credible region
+
+        // Get display coordinates
+        let coord1, coord2;
+        if (coordSystem === 'galactic') {
+            const gal = equatorialToGalactic(px.ra, px.dec);
+            coord1 = gal.l;
+            coord2 = gal.b;
+        } else {
+            coord1 = px.ra;
+            coord2 = px.dec;
+        }
+
+        const p = projectMollweide(coord1, coord2);
+
+        // Color by probability (normalized to max)
+        const t = Math.pow(px.prob / maxProb, 0.5); // sqrt scaling for better contrast
+        const c = viridisColor(t);
+
+        // Approximate pixel angular size for NSIDE=16: ~3.66 degrees
+        // Draw a small filled circle proportional to pixel area
+        const pixRadius = Math.max(3, SCALE * 0.065); // ~3.66 deg in Mollweide scale
+
+        ctx.fillStyle = `rgb(${c.r}, ${c.g}, ${c.b})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, pixRadius, 0, 2 * PI);
+        ctx.fill();
+    });
+
+    ctx.restore();
+
+    // Draw credible region boundary
+    drawCredibleBoundary(thresh);
+}
+
+function drawCredibleBoundary(thresh) {
+    if (!healpixMap) return;
+    // Draw a glowing outline around the credible region pixels
+    ctx.save();
+    ctx.strokeStyle = 'rgba(34, 211, 238, 0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.shadowColor = 'rgba(34, 211, 238, 0.5)';
+    ctx.shadowBlur = 8;
+
+    // Collect projected positions of boundary pixels
+    const regionPixels = healpixMap.pixels.filter(px => px.prob >= thresh);
+    if (regionPixels.length === 0) { ctx.restore(); return; }
+
+    // Simple convex-hull-like boundary: draw the outline of the region
+    // For now, draw individual pixel outlines
+    regionPixels.forEach(px => {
+        let coord1, coord2;
+        if (coordSystem === 'galactic') {
+            const gal = equatorialToGalactic(px.ra, px.dec);
+            coord1 = gal.l;
+            coord2 = gal.b;
+        } else {
+            coord1 = px.ra;
+            coord2 = px.dec;
+        }
+        const p = projectMollweide(coord1, coord2);
+        const pixRadius = Math.max(3, SCALE * 0.065);
+
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, pixRadius + 1, 0, 2 * PI);
+        ctx.stroke();
+    });
+
+    ctx.restore();
 }
 
 function drawLens(mx, my) {
@@ -1216,21 +1719,39 @@ function closeSelection() {
 }
 
 function updateSelectionPosterior() {
-    if (!posteriorMap) return;
-    const { probs, sorted, cols, rows, res } = posteriorMap;
-    let sum = 0;
-    let thresh = 0;
-    for (let p of sorted) { sum += p; if (sum >= credibleLevel) { thresh = p; break; } }
     selectedIds.clear();
-    getVisiblePoints().forEach(d => {
-        const c = Math.floor(d.px / res);
-        const r = Math.floor(d.py / res);
-        if (c >= 0 && c < cols && r >= 0 && r < rows) {
-            if (probs[r * cols + c] >= thresh) selectedIds.add(d.id);
-        }
-    });
+
+    if (healpixMap) {
+        // HEALPix-based selection: look up each galaxy's pixel in the map
+        const thresh = getCredibleThreshold(credibleLevel);
+        getVisiblePoints().forEach(d => {
+            if (d.type === 'Pulsar') return; // don't select pulsars
+            const prob = getHealpixProb(d.ra, d.dec);
+            if (prob >= thresh) selectedIds.add(d.id);
+        });
+    } else if (posteriorMap) {
+        // Fallback: MCMC screen-space posterior
+        const { probs, sorted, cols, rows, res } = posteriorMap;
+        let sum = 0;
+        let thresh = 0;
+        for (let p of sorted) { sum += p; if (sum >= credibleLevel) { thresh = p; break; } }
+        getVisiblePoints().forEach(d => {
+            const c = Math.floor(d.px / res);
+            const r = Math.floor(d.py / res);
+            if (c >= 0 && c < cols && r >= 0 && r < rows) {
+                if (probs[r * cols + c] >= thresh) selectedIds.add(d.id);
+            }
+        });
+    }
+
+    if (selectedIds.size > 0) {
+        const selPoints = projectedData.filter(d => selectedIds.has(d.id));
+        showInspector(selPoints.slice(0, 50));
+    }
+
     updateStats();
     drawHistograms();
+    draw();
 }
 
 function getVisiblePoints() {
