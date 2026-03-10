@@ -4,6 +4,14 @@ import numpy as np
 import streamlit.components.v1 as components
 import os
 
+# --- CONFIGURATION ---
+# Set this to the URL of your hosted catalog.parquet file.
+# When empty, the app falls back to mock data generated client-side.
+# Examples:
+#   PARQUET_URL = "https://github.com/stevertaylor/galaxy-catalog-viewscreen/releases/download/v1.0/catalog.parquet"
+#   PARQUET_URL = "https://your-bucket.s3.amazonaws.com/catalog.parquet"
+PARQUET_URL = os.environ.get('PARQUET_URL', '')
+
 # --- PAGE CONFIG ---
 st.set_page_config(
     page_title="Galaxy Catalog Viewscreen",
@@ -134,8 +142,8 @@ except Exception as e:
     st.error(f"Error loading pulsar data: {e}")
     PULSARS = []
 
-# Don't load galaxy catalog by default - use mock data for faster startup
-# Users can upload their own catalog via the UI
+# Galaxy catalog is now loaded client-side via DuckDB-WASM
+# No server-side loading needed
 GALAXIES = []
 
 # Scan data/ for all .npy HEALPix skymap files and pre-load them
@@ -157,13 +165,16 @@ try:
     index_html = load_file('frontend/index.html')
     style_css = load_file('frontend/style.css')
     script_js = load_file('frontend/script.js')
+    duckdb_worker_js = load_file('frontend/duckdb-worker.js')
 
     # Inject CSS, JS, and Data into the HTML template
     html_code = index_html.replace('{{ STYLE_CSS }}', style_css)
     html_code = html_code.replace('{{ SCRIPT_JS }}', script_js)
+    html_code = html_code.replace('{{ DUCKDB_WORKER_JS }}', duckdb_worker_js)
     html_code = html_code.replace('{{ PULSARS_JSON }}', json.dumps(PULSARS))
     html_code = html_code.replace('{{ GALAXIES_JSON }}', json.dumps(GALAXIES))
     html_code = html_code.replace('{{ HEALPIX_FILES_JSON }}', json.dumps(HEALPIX_FILES))
+    html_code = html_code.replace('{{ PARQUET_URL }}', PARQUET_URL)
 
     # --- RENDER COMPONENT ---
     components.html(html_code, height=850, scrolling=False)
