@@ -7,6 +7,161 @@ let projectedData = [];
 let pulsarPoints = [];
 let healpixMap = null; // {nside, npix, probs: Float64Array, pixels: [{ipix, ra, dec, prob}]}
 
+// --- DUCKDB-WASM LAYER ---
+const PARQUET_URL = window.galaxyAppData?.parquetUrl || '';
+const useDuckDB = PARQUET_URL.length > 0;
+let duckDBWorker = null;
+let duckDBReady = false;
+let duckDBQueryId = 0;
+let duckDBCallbacks = {}; // id -> {resolve, reject}
+let totalGalaxyCount = 0;
+let densityMap = null; // {nside, npix, pixels: {idx: count}}
+let duckDBLoading = false; // true while a query is in flight
+let filterDebounceTimer = null;
+
+function sendDuckDBQuery(type, params) {
+    return new Promise((resolve, reject) => {
+        const id = ++duckDBQueryId;
+        duckDBCallbacks[id] = { resolve, reject };
+        duckDBWorker.postMessage({ id, type, ...params });
+    });
+}
+
+function initDuckDBWorker() {
+    if (!useDuckDB) return Promise.resolve();
+
+    return new Promise((resolve, reject) => {
+        duckDBWorker = new Worker(window._duckdbWorkerUrl);
+        duckDBWorker.onmessage = function (e) {
+            const { id, type, result, error } = e.data;
+            const cb = duckDBCallbacks[id];
+            if (cb) {
+                delete duckDBCallbacks[id];
+                if (error) cb.reject(new Error(error));
+                else cb.resolve(result);
+            }
+        };
+        duckDBWorker.onerror = function (e) {
+            console.error('DuckDB Worker error:', e);
+        };
+
+        // Initialize with the Parquet URL
+        sendDuckDBQuery('init', { parquetUrl: PARQUET_URL })
+            .then(() => {
+                duckDBReady = true;
+                console.log('DuckDB-WASM ready');
+                resolve();
+            })
+            .catch(err => {
+                console.error('DuckDB init failed:', err);
+                reject(err);
+            });
+    });
+}
+
+/** Fetch galaxies from DuckDB with current filters, then re-render. */
+async function fetchAndRenderGalaxies() {
+    if (!useDuckDB || !duckDBReady) return;
+    duckDBLoading = true;
+    try {
+        const [galaxies, count] = await Promise.all([
+            sendDuckDBQuery('galaxies', {
+                dist_min: filterDistMin, dist_max: filterDistMax,
+                mass_min: filterMassMin, mass_max: filterMassMax,
+                limit: 60000
+            }),
+            sendDuckDBQuery('count', {
+                dist_min: filterDistMin, dist_max: filterDistMax,
+                mass_min: filterMassMin, mass_max: filterMassMax
+            })
+        ]);
+
+        galaxyData = galaxies.map(g => ({
+            id: g.id, ra: g.ra, dec: g.dec,
+            dist: g.dist, mass: g.mass, type: 'Galaxy'
+        }));
+        totalGalaxyCount = typeof count === 'number' ? count : (count?.total || galaxyData.length);
+
+        refreshData();
+
+        const statusText = document.getElementById('status-galaxies');
+        if (statusText) statusText.innerText = `${totalGalaxyCount.toLocaleString()} galaxies (showing ${galaxyData.length.toLocaleString()})`;
+    } catch (err) {
+        console.error('Galaxy fetch error:', err);
+    }
+    duckDBLoading = false;
+}
+
+/** Fetch histograms from DuckDB and draw them. */
+async function fetchAndDrawHistograms() {
+    if (!useDuckDB || !duckDBReady) { drawHistograms(); return; }
+    try {
+        const [distBins, massBins] = await Promise.all([
+            sendDuckDBQuery('histogram', {
+                field: 'dist', bins: 30, min_val: 0, max_val: 500,
+                dist_min: filterDistMin, dist_max: filterDistMax,
+                mass_min: filterMassMin, mass_max: filterMassMax
+            }),
+            sendDuckDBQuery('histogram', {
+                field: 'mass', bins: 30, min_val: 6, max_val: 10.5,
+                dist_min: filterDistMin, dist_max: filterDistMax,
+                mass_min: filterMassMin, mass_max: filterMassMax
+            })
+        ]);
+        drawHistogramFromBins(distCtx, distBins, 30, 0, 500, '#d946ef');
+        drawHistogramFromBins(massCtx, massBins, 30, 6, 10.5, '#22d3ee');
+    } catch (err) {
+        console.error('Histogram fetch error:', err);
+        drawHistograms(); // fallback to client-side
+    }
+}
+
+/** Draw histogram from server-computed bins. */
+function drawHistogramFromBins(ctx, bins, numBins, min, max, color) {
+    ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, 270, 85);
+    const step = (max - min) / numBins;
+    const counts = new Array(numBins).fill(0);
+    bins.forEach(b => {
+        const idx = typeof b.bin === 'number' ? b.bin : parseInt(b.bin);
+        if (idx >= 0 && idx < numBins) counts[idx] = b.cnt;
+    });
+    const maxCount = Math.max(...counts, 1);
+    const w = 270 / numBins;
+    const chartH = 60;
+
+    ctx.fillStyle = color;
+    counts.forEach((c, i) => {
+        const h = (c / maxCount) * chartH;
+        ctx.fillRect(i * w, chartH - h, w - 1, h);
+    });
+
+    ctx.strokeStyle = '#334155';
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.lineWidth = 1;
+    const numTicks = 5;
+    for (let i = 0; i < numTicks; i++) {
+        const val = min + (i * (max - min) / (numTicks - 1));
+        const x = (i * 270 / (numTicks - 1));
+        ctx.beginPath(); ctx.moveTo(x, chartH); ctx.lineTo(x, chartH + 5); ctx.stroke();
+        if (i === 0) ctx.textAlign = 'left';
+        else if (i === numTicks - 1) ctx.textAlign = 'right';
+        else ctx.textAlign = 'center';
+        ctx.fillText(val.toFixed(max < 100 ? 1 : 0), x, chartH + 15);
+    }
+}
+
+/** Debounced filter change handler — coalesces slider changes. */
+function debouncedFilterUpdate() {
+    if (!useDuckDB) return;
+    if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
+    filterDebounceTimer = setTimeout(() => {
+        fetchAndRenderGalaxies();
+        fetchAndDrawHistograms();
+    }, 300);
+}
+
 // --- UTILS ---
 function setupHighDPI(canv, w, h) {
     const dpr = window.devicePixelRatio || 1;
@@ -402,9 +557,9 @@ function refreshData() {
     });
     pulsarPoints = projectedData.filter(d => d.type === 'Pulsar');
     buildSpatialGrid();
-    document.getElementById('count-total').innerText = rawData.length;
+    document.getElementById('count-total').innerText = useDuckDB ? totalGalaxyCount.toLocaleString() : rawData.length;
     draw();
-    drawHistograms();
+    if (!useDuckDB) drawHistograms();
 }
 
 // --- CONFIG ---
@@ -538,10 +693,33 @@ function init() {
     distCtx = setupHighDPI(document.getElementById('hist-dist'), 270, 85);
     massCtx = setupHighDPI(document.getElementById('hist-mass'), 270, 85);
 
-    // Always use mock data by default for faster startup
-    galaxyData = generateMockData();
-    const statusText = document.getElementById('status-galaxies');
-    if (statusText) statusText.innerText = 'Using synthetic data';
+    // Data initialization: use DuckDB if PARQUET_URL is set, else mock data
+    if (useDuckDB) {
+        const statusText = document.getElementById('status-galaxies');
+        if (statusText) {
+            statusText.innerText = 'Connecting to catalog...';
+            statusText.classList.add('loading');
+        }
+        initDuckDBWorker()
+            .then(() => {
+                if (statusText) statusText.classList.remove('loading');
+                return fetchAndRenderGalaxies();
+            })
+            .then(() => fetchAndDrawHistograms())
+            .catch(err => {
+                console.error('DuckDB startup failed, falling back to mock data:', err);
+                if (statusText) {
+                    statusText.innerText = 'Catalog unavailable — using synthetic data';
+                    statusText.classList.remove('loading');
+                }
+                galaxyData = generateMockData();
+                refreshData();
+            });
+    } else {
+        galaxyData = generateMockData();
+        const statusText = document.getElementById('status-galaxies');
+        if (statusText) statusText.innerText = 'Using synthetic data';
+    }
 
     // Load pre-loaded HEALPix skymaps and populate dropdown
     loadPreloadedSkymaps();
@@ -583,7 +761,7 @@ function init() {
         clickedId = null;
         lassoPoints = [];
         inspector.style.display = 'none';
-        drawHistograms();
+        if (useDuckDB) fetchAndDrawHistograms(); else drawHistograms();
         updateStats();
     };
 
@@ -676,8 +854,7 @@ function init() {
             distMaxSlider.value = filterDistMax;
         }
         updateFilterLabels();
-        draw();
-        drawHistograms();
+        if (useDuckDB) { debouncedFilterUpdate(); } else { draw(); drawHistograms(); }
     };
 
     distMaxSlider.oninput = (e) => {
@@ -687,8 +864,7 @@ function init() {
             distMinSlider.value = filterDistMin;
         }
         updateFilterLabels();
-        draw();
-        drawHistograms();
+        if (useDuckDB) { debouncedFilterUpdate(); } else { draw(); drawHistograms(); }
     };
 
     massMinSlider.oninput = (e) => {
@@ -698,8 +874,7 @@ function init() {
             massMinSlider.value = filterMassMax;
         }
         updateFilterLabels();
-        draw();
-        drawHistograms();
+        if (useDuckDB) { debouncedFilterUpdate(); } else { draw(); drawHistograms(); }
     };
 
     massMaxSlider.oninput = (e) => {
@@ -709,8 +884,7 @@ function init() {
             massMinSlider.value = filterMassMin;
         }
         updateFilterLabels();
-        draw();
-        drawHistograms();
+        if (useDuckDB) { debouncedFilterUpdate(); } else { draw(); drawHistograms(); }
     };
 
     function animate(timestamp) {
@@ -1677,7 +1851,7 @@ function closeSelection() {
         }
         lassoPoints = [];
         draw();
-        drawHistograms();
+        if (useDuckDB) fetchAndDrawHistograms(); else drawHistograms();
         updateStats();
         return;
     }
@@ -1714,7 +1888,7 @@ function closeSelection() {
     }
 
     draw();
-    drawHistograms();
+    if (useDuckDB) fetchAndDrawHistograms(); else drawHistograms();
     updateStats();
 }
 
@@ -1750,12 +1924,16 @@ function updateSelectionPosterior() {
     }
 
     updateStats();
-    drawHistograms();
+    if (useDuckDB) fetchAndDrawHistograms(); else drawHistograms();
     draw();
 }
 
 function getVisiblePoints() {
     let pts = showPulsars ? projectedData : projectedData.filter(d => d.type !== 'Pulsar');
+    if (useDuckDB) {
+        // In DuckDB mode, galaxies are already filter-limited server-side
+        return pts;
+    }
     return pts.filter(d => {
         if (d.type === 'Pulsar') return true;
         return d.dist >= filterDistMin && d.dist <= filterDistMax &&
@@ -1763,11 +1941,33 @@ function getVisiblePoints() {
     });
 }
 
-function searchGalaxy() {
+async function searchGalaxy() {
     const query = document.getElementById('search-input').value.trim().toLowerCase();
     if (!query) return;
 
-    const point = projectedData.find(d => d.id.toLowerCase().includes(query));
+    let point = null;
+
+    if (useDuckDB && duckDBReady) {
+        // Search via DuckDB
+        try {
+            const results = await sendDuckDBQuery('search', { q: query, limit: 1 });
+            if (results.length > 0) {
+                const g = results[0];
+                // Add to galaxyData so it can be projected
+                const newGalaxy = { id: g.id, ra: g.ra, dec: g.dec, dist: g.dist, mass: g.mass, type: 'Galaxy' };
+                if (!galaxyData.find(d => d.id === g.id)) {
+                    galaxyData.push(newGalaxy);
+                    refreshData();
+                }
+                point = projectedData.find(d => d.id === g.id);
+            }
+        } catch (err) {
+            console.error('Search error:', err);
+        }
+    } else {
+        point = projectedData.find(d => d.id.toLowerCase().includes(query));
+    }
+
     if (point) {
         // Update center longitude to the galaxy's RA
         if (coordSystem !== 'galactic') {
@@ -1803,7 +2003,7 @@ function searchGalaxy() {
         }
 
         draw();
-        drawHistograms();
+        if (useDuckDB) fetchAndDrawHistograms(); else drawHistograms();
         updateStats();
 
         animationTime = performance.now();
@@ -1830,16 +2030,28 @@ function searchGalaxy() {
     }
 }
 
-function exportSelection() {
+async function exportSelection() {
     if (selectedIds.size === 0) {
         alert("Please select some galaxies first using the Lasso or Polygon tool.");
         return;
     }
 
-    const selectedPoints = projectedData.filter(d => selectedIds.has(d.id));
+    let selectedPoints;
+    if (useDuckDB && duckDBReady) {
+        try {
+            selectedPoints = await sendDuckDBQuery('export', { ids: Array.from(selectedIds) });
+        } catch (err) {
+            console.error('Export error:', err);
+            // Fallback to local data
+            selectedPoints = projectedData.filter(d => selectedIds.has(d.id));
+        }
+    } else {
+        selectedPoints = projectedData.filter(d => selectedIds.has(d.id));
+    }
+
     let csv = "id,ra,dec,dist,mass,type\n";
     selectedPoints.forEach(p => {
-        csv += `${p.id},${p.ra},${p.dec},${p.dist},${p.mass},${p.type}\n`;
+        csv += `${p.id},${p.ra},${p.dec},${p.dist},${p.mass},${p.type || 'Galaxy'}\n`;
     });
 
     const blob = new Blob([csv], { type: 'text/csv' });
