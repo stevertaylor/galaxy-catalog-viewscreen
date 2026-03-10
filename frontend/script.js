@@ -82,6 +82,7 @@ async function fetchAndRenderGalaxies() {
         }));
         totalGalaxyCount = typeof count === 'number' ? count : (count?.total || galaxyData.length);
 
+        updateDataRanges();
         refreshData();
 
         const statusText = document.getElementById('status-galaxies');
@@ -98,18 +99,18 @@ async function fetchAndDrawHistograms() {
     try {
         const [distBins, massBins] = await Promise.all([
             sendDuckDBQuery('histogram', {
-                field: 'dist', bins: 30, min_val: 0, max_val: 500,
+                field: 'dist', bins: 30, min_val: dataDistMin, max_val: dataDistMax,
                 dist_min: filterDistMin, dist_max: filterDistMax,
                 mass_min: filterMassMin, mass_max: filterMassMax
             }),
             sendDuckDBQuery('histogram', {
-                field: 'mass', bins: 30, min_val: 6, max_val: 10.5,
+                field: 'mass', bins: 30, min_val: dataMassMin, max_val: dataMassMax,
                 dist_min: filterDistMin, dist_max: filterDistMax,
                 mass_min: filterMassMin, mass_max: filterMassMax
             })
         ]);
-        drawHistogramFromBins(distCtx, distBins, 30, 0, 500, '#d946ef');
-        drawHistogramFromBins(massCtx, massBins, 30, 6, 10.5, '#22d3ee');
+        drawHistogramFromBins(distCtx, distBins, 30, dataDistMin, dataDistMax, '#d946ef');
+        drawHistogramFromBins(massCtx, massBins, 30, dataMassMin, dataMassMax, '#22d3ee');
     } catch (err) {
         console.error('Histogram fetch error:', err);
         drawHistograms(); // fallback to client-side
@@ -248,6 +249,7 @@ async function handleGalaxyUpload(e) {
         await new Promise(r => setTimeout(r, 10));
 
         galaxyData = newData;
+        updateDataRanges();
         refreshData();
 
         progressBar.style.width = '100%';
@@ -639,6 +641,69 @@ let filterDistMax = 500;
 let filterMassMin = 6.0;
 let filterMassMax = 10.5;
 
+// Actual data ranges (updated when catalog changes)
+let dataDistMin = 0;
+let dataDistMax = 500;
+let dataMassMin = 6.0;
+let dataMassMax = 10.5;
+
+/** Compute data ranges from galaxyData and update sliders + filter limits. */
+function updateDataRanges() {
+    const galaxies = galaxyData.filter(d => d.type !== 'Pulsar');
+    if (galaxies.length === 0) return;
+
+    let dMin = Infinity, dMax = -Infinity, mMin = Infinity, mMax = -Infinity;
+    galaxies.forEach(d => {
+        if (d.dist < dMin) dMin = d.dist;
+        if (d.dist > dMax) dMax = d.dist;
+        if (d.mass < mMin) mMin = d.mass;
+        if (d.mass > mMax) mMax = d.mass;
+    });
+
+    // Round to nice values
+    dataDistMin = Math.floor(dMin);
+    dataDistMax = Math.ceil(dMax);
+    dataMassMin = Math.floor(mMin * 10) / 10;
+    dataMassMax = Math.ceil(mMax * 10) / 10;
+
+    // Update filter state to match full range
+    filterDistMin = dataDistMin;
+    filterDistMax = dataDistMax;
+    filterMassMin = dataMassMin;
+    filterMassMax = dataMassMax;
+
+    // Update slider DOM attributes
+    const distMinSlider = document.getElementById('filter-dist-min');
+    const distMaxSlider = document.getElementById('filter-dist-max');
+    const massMinSlider = document.getElementById('filter-mass-min');
+    const massMaxSlider = document.getElementById('filter-mass-max');
+
+    if (distMinSlider) {
+        distMinSlider.min = dataDistMin;
+        distMinSlider.max = dataDistMax;
+        distMinSlider.value = dataDistMin;
+    }
+    if (distMaxSlider) {
+        distMaxSlider.min = dataDistMin;
+        distMaxSlider.max = dataDistMax;
+        distMaxSlider.value = dataDistMax;
+    }
+    if (massMinSlider) {
+        massMinSlider.min = dataMassMin;
+        massMinSlider.max = dataMassMax;
+        massMinSlider.step = (dataMassMax - dataMassMin) > 5 ? '0.5' : '0.1';
+        massMinSlider.value = dataMassMin;
+    }
+    if (massMaxSlider) {
+        massMaxSlider.min = dataMassMin;
+        massMaxSlider.max = dataMassMax;
+        massMaxSlider.step = (dataMassMax - dataMassMin) > 5 ? '0.5' : '0.1';
+        massMaxSlider.value = dataMassMax;
+    }
+
+    updateFilterLabels();
+}
+
 let centerLon = 180;
 
 // --- COORDINATE CONVERSION ---
@@ -713,10 +778,12 @@ function init() {
                     statusText.classList.remove('loading');
                 }
                 galaxyData = generateMockData();
+                updateDataRanges();
                 refreshData();
             });
     } else {
         galaxyData = generateMockData();
+        updateDataRanges();
         const statusText = document.getElementById('status-galaxies');
         if (statusText) statusText.innerText = 'Using synthetic data';
     }
@@ -2102,8 +2169,8 @@ function drawHistograms() {
     const subset = getVisiblePoints().filter(d => selectedIds.has(d.id) && d.type !== 'Pulsar');
     const all = getVisiblePoints().filter(d => d.type !== 'Pulsar');
     if (all.length === 0) return;
-    drawBarChart(distCtx, all, subset, 'dist', 0, 500, '#d946ef');
-    drawBarChart(massCtx, all, subset, 'mass', 6, 10.5, '#22d3ee');
+    drawBarChart(distCtx, all, subset, 'dist', dataDistMin, dataDistMax, '#d946ef');
+    drawBarChart(massCtx, all, subset, 'mass', dataMassMin, dataMassMax, '#22d3ee');
 }
 
 function drawBarChart(ctx, allData, selData, field, min, max, color) {
