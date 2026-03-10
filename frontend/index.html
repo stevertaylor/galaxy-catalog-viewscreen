@@ -19,13 +19,12 @@
       <div
         style="font-size: 18px; font-weight: 700; color: #22d3ee; letter-spacing: -0.02em; text-shadow: 0 0 20px rgba(34, 211, 238, 0.3);">
         GALAXY VIEWSCREEN</div>
-      <div style="font-size: 9px; color: #94a3b8; margin-bottom: 20px;">2MRS Catalog &amp; NANOGrav Pulsars</div>
 
       <div style="font-size: 11px; font-weight: bold; margin-bottom: 15px; color: #f8fafc;">DATA SOURCES</div>
 
       <div class="file-input-group">
-        <label class="file-input-label">Galaxy Catalog (.txt)</label>
-        <input type="file" id="upload-galaxies" accept=".txt,.dat">
+        <label class="file-input-label">Galaxy Catalog (.txt, .parquet)</label>
+        <input type="file" id="upload-galaxies" accept=".txt,.dat,.parquet">
         <div class="progress-container" id="progress-galaxies">
           <div class="progress-bar" id="progress-bar-galaxies"></div>
         </div>
@@ -187,6 +186,7 @@
         <div class="stars-layer layer-2"></div>
         <div class="stars-layer layer-3"></div>
       </div>
+      <canvas id="gl-canvas" style="position: absolute; z-index: 0;"></canvas>
       <canvas id="gl-canvas" style="position: absolute; z-index: 0;"></canvas>
       <canvas id="main-canvas" style="position: relative; z-index: 1;"></canvas>
       <div class="inspector" id="inspector">

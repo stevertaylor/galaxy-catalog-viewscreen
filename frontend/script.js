@@ -211,36 +211,132 @@ async function handleGalaxyUpload(e) {
     statusText.innerText = 'Reading file...';
     statusText.classList.add('loading');
 
-    // Small delay to let UI update
     await new Promise(r => setTimeout(r, 10));
 
-    const text = await file.text();
-    progressBar.style.width = '20%';
-    statusText.innerText = 'Parsing data...';
+    const isParquet = file.name.toLowerCase().endsWith('.parquet');
+    let newData = [];
 
-    await new Promise(r => setTimeout(r, 10));
+    if (isParquet) {
+        // --- PARQUET PATH: use hyparquet (pure JS, no WASM/Arrow needed) ---
+        try {
+            progressBar.style.width = '10%';
+            statusText.innerText = 'Loading Parquet reader...';
+            await new Promise(r => setTimeout(r, 10));
 
-    const lines = text.split(/\r?\n/);
-    const totalLines = lines.length;
-    const newData = [];
+            // Load hyparquet via esm.sh CDN (pure JS Parquet reader)
+            if (!globalThis._hyparquet) {
+                globalThis._hyparquet = await import('https://esm.sh/hyparquet@1.3.0');
+            }
+            const { parquetRead } = globalThis._hyparquet;
 
-    // Process in chunks to allow UI updates
-    const chunkSize = 5000;
-    for (let i = 0; i < totalLines; i += chunkSize) {
-        const chunk = lines.slice(i, Math.min(i + chunkSize, totalLines));
-        chunk.forEach(line => {
-            line = line.trim();
-            if (!line || !/^\d/.test(line)) return;
-            const parts = line.split(/\s+/);
-            if (parts.length < 3) return;
-            const coords = parseCoordinate(parts[0]);
-            if (coords) newData.push({ id: parts[0], ra: coords[0], dec: coords[1], dist: parseFloat(parts[1]), mass: parseFloat(parts[2]), type: "Galaxy" });
-        });
+            progressBar.style.width = '30%';
+            statusText.innerText = 'Reading Parquet file...';
+            await new Promise(r => setTimeout(r, 10));
 
-        // Update progress (20% to 80% for parsing)
-        const progress = 20 + (Math.min(i + chunkSize, totalLines) / totalLines) * 60;
-        progressBar.style.width = progress + '%';
-        await new Promise(r => setTimeout(r, 0));
+            const arrayBuffer = await file.arrayBuffer();
+            progressBar.style.width = '50%';
+            statusText.innerText = 'Decoding columns...';
+            await new Promise(r => setTimeout(r, 10));
+
+            // Read all rows from the Parquet file
+            await parquetRead({
+                file: arrayBuffer,
+                onComplete: (rows) => {
+                    if (!rows || rows.length === 0) return;
+
+                    // Detect column indices from first row keys (if object) or use header
+                    const firstRow = rows[0];
+                    const isObject = typeof firstRow === 'object' && !Array.isArray(firstRow);
+
+                    progressBar.style.width = '70%';
+                    statusText.innerText = `Processing ${rows.length.toLocaleString()} rows...`;
+
+                    if (isObject) {
+                        // Rows are objects with column names as keys
+                        const keys = Object.keys(firstRow).map(k => k.toLowerCase());
+                        const findKey = (...names) => {
+                            for (const n of names) {
+                                const orig = Object.keys(firstRow).find(k => k.toLowerCase() === n);
+                                if (orig) return orig;
+                            }
+                            return null;
+                        };
+
+                        const idKey = findKey('id', 'name');
+                        const raKey = findKey('ra');
+                        const decKey = findKey('dec');
+                        const distKey = findKey('dist', 'distance');
+                        const massKey = findKey('mass', 'log_mass', 'logmass');
+
+                        if (!raKey || !decKey) {
+                            throw new Error('Parquet file must have "ra" and "dec" columns');
+                        }
+
+                        for (let i = 0; i < rows.length; i++) {
+                            const r = rows[i];
+                            const ra = Number(r[raKey]);
+                            const dec = Number(r[decKey]);
+                            if (isNaN(ra) || isNaN(dec)) continue;
+                            newData.push({
+                                id: idKey ? String(r[idKey]) : `G${i}`,
+                                ra, dec,
+                                dist: distKey ? Number(r[distKey]) || 0 : 0,
+                                mass: massKey ? Number(r[massKey]) || 0 : 0,
+                                type: "Galaxy"
+                            });
+                        }
+                    } else if (Array.isArray(firstRow)) {
+                        // Rows are arrays — assume positional: [id, ra, dec, dist, mass, ...]
+                        for (let i = 0; i < rows.length; i++) {
+                            const r = rows[i];
+                            const ra = Number(r[1]);
+                            const dec = Number(r[2]);
+                            if (isNaN(ra) || isNaN(dec)) continue;
+                            newData.push({
+                                id: r[0] != null ? String(r[0]) : `G${i}`,
+                                ra, dec,
+                                dist: r.length > 3 ? Number(r[3]) || 0 : 0,
+                                mass: r.length > 4 ? Number(r[4]) || 0 : 0,
+                                type: "Galaxy"
+                            });
+                        }
+                    }
+                }
+            });
+        } catch (err) {
+            console.error('Parquet parse error:', err);
+            progressContainer.classList.remove('active');
+            statusText.classList.remove('loading');
+            statusText.innerText = `Error: ${err.message}`;
+            statusText.style.color = '#f87171';
+            return;
+        }
+    } else {
+        // --- TEXT PATH: existing line-by-line parsing ---
+        const text = await file.text();
+        progressBar.style.width = '20%';
+        statusText.innerText = 'Parsing data...';
+        await new Promise(r => setTimeout(r, 10));
+
+        const lines = text.split(/\r?\n/);
+        const totalLines = lines.length;
+
+        const chunkSize = 5000;
+        for (let i = 0; i < totalLines; i += chunkSize) {
+            const chunk = lines.slice(i, Math.min(i + chunkSize, totalLines));
+            chunk.forEach(line => {
+                line = line.trim();
+                if (!line || !/^\d/.test(line)) return;
+                const parts = line.split(/\s+/);
+                if (parts.length < 3) return;
+                const coords = parseCoordinate(parts[0]);
+                if (coords) newData.push({ id: parts[0], ra: coords[0], dec: coords[1], dist: parseFloat(parts[1]), mass: parseFloat(parts[2]), type: "Galaxy" });
+            });
+
+            const progress = 20 + (Math.min(i + chunkSize, totalLines) / totalLines) * 60;
+            progressBar.style.width = progress + '%';
+            await new Promise(r => setTimeout(r, 0));
+        }
     }
 
     if (newData.length > 0) {
@@ -254,9 +350,8 @@ async function handleGalaxyUpload(e) {
 
         progressBar.style.width = '100%';
         statusText.classList.remove('loading');
-        statusText.innerText = `Loaded ${newData.length} galaxies`;
+        statusText.innerText = `Loaded ${newData.length.toLocaleString()} galaxies` + (isParquet ? ' (Parquet)' : '');
 
-        // Hide progress bar after a short delay
         setTimeout(() => progressContainer.classList.remove('active'), 500);
     } else {
         progressContainer.classList.remove('active');
@@ -550,6 +645,38 @@ function clearPosterior() {
     draw();
 }
 
+const RENDER_CAP = 50000; // max galaxies to draw on canvas
+let displayData = [];     // subset of projectedData used for rendering (capped)
+
+/** Rebuild the capped display subset from projectedData, applying current filters. */
+function rebuildDisplayData() {
+    // Apply current filter sliders to galaxies
+    const filtered = projectedData.filter(d => {
+        if (d.type === 'Pulsar') return false;
+        return d.dist >= filterDistMin && d.dist <= filterDistMax &&
+            d.mass >= filterMassMin && d.mass <= filterMassMax;
+    });
+    if (filtered.length > RENDER_CAP) {
+        const arr = filtered.slice();
+        for (let i = arr.length - 1; i > arr.length - 1 - RENDER_CAP && i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        displayData = [...arr.slice(arr.length - RENDER_CAP), ...pulsarPoints];
+    } else {
+        displayData = [...filtered, ...pulsarPoints];
+    }
+
+    // Update counts to reflect current filter
+    const totalEl = document.getElementById('count-total');
+    if (totalEl) totalEl.innerText = filtered.length.toLocaleString();
+    const selEl = document.getElementById('count-sel');
+    if (selEl) {
+        const filteredSelected = filtered.filter(d => selectedIds.has(d.id)).length;
+        selEl.innerText = filteredSelected;
+    }
+}
+
 function refreshData() {
     rawData = [...galaxyData, ...initialPulsars.map(p => ({ ...p, dist: 0, mass: 0, type: "Pulsar" }))];
     projectedData = rawData.map(d => {
@@ -558,6 +685,17 @@ function refreshData() {
         return { ...d, px: p.x, py: p.y, displayCoord1: coords.coord1, displayCoord2: coords.coord2 };
     });
     pulsarPoints = projectedData.filter(d => d.type === 'Pulsar');
+
+    rebuildDisplayData();
+
+    // Show count info
+    const galaxyCount = projectedData.filter(d => d.type !== 'Pulsar').length;
+    if (galaxyCount > RENDER_CAP) {
+        const statusText = document.getElementById('status-galaxies');
+        if (statusText) statusText.innerText =
+            `${galaxyCount.toLocaleString()} galaxies (showing ${RENDER_CAP.toLocaleString()})`;
+    }
+
     buildSpatialGrid();
     document.getElementById('count-total').innerText = useDuckDB ? totalGalaxyCount.toLocaleString() : rawData.length;
     draw();
@@ -611,6 +749,7 @@ function updateCanvasSize() {
             return { ...d, px: p.x, py: p.y, displayCoord1: coords.coord1, displayCoord2: coords.coord2 };
         });
         pulsarPoints = projectedData.filter(d => d.type === 'Pulsar');
+        rebuildDisplayData();
         buildSpatialGrid();
         draw();
     }
@@ -758,6 +897,9 @@ function init() {
     distCtx = setupHighDPI(document.getElementById('hist-dist'), 270, 85);
     massCtx = setupHighDPI(document.getElementById('hist-mass'), 270, 85);
 
+    // Size canvas to actual container BEFORE projecting any data
+    updateCanvasSize();
+
     // Data initialization: use DuckDB if PARQUET_URL is set, else mock data
     if (useDuckDB) {
         const statusText = document.getElementById('status-galaxies');
@@ -875,6 +1017,7 @@ function init() {
             return { ...d, px: p.x, py: p.y, displayCoord1: coords.coord1, displayCoord2: coords.coord2 };
         });
         pulsarPoints = projectedData.filter(d => d.type === 'Pulsar');
+        rebuildDisplayData();
         buildSpatialGrid();
 
         if (posteriorSamples.length > 0) {
@@ -900,8 +1043,6 @@ function init() {
         updateCanvasSize();
     });
 
-    updateCanvasSize();
-
     document.getElementById('btn-search').onclick = searchGalaxy;
     document.getElementById('search-input').onkeypress = (e) => {
         if (e.key === 'Enter') searchGalaxy();
@@ -921,7 +1062,7 @@ function init() {
             distMaxSlider.value = filterDistMax;
         }
         updateFilterLabels();
-        if (useDuckDB) { debouncedFilterUpdate(); } else { draw(); drawHistograms(); }
+        if (useDuckDB) { debouncedFilterUpdate(); } else { rebuildDisplayData(); buildSpatialGrid(); draw(); drawHistograms(); }
     };
 
     distMaxSlider.oninput = (e) => {
@@ -931,7 +1072,7 @@ function init() {
             distMinSlider.value = filterDistMin;
         }
         updateFilterLabels();
-        if (useDuckDB) { debouncedFilterUpdate(); } else { draw(); drawHistograms(); }
+        if (useDuckDB) { debouncedFilterUpdate(); } else { rebuildDisplayData(); buildSpatialGrid(); draw(); drawHistograms(); }
     };
 
     massMinSlider.oninput = (e) => {
@@ -941,7 +1082,7 @@ function init() {
             massMinSlider.value = filterMassMax;
         }
         updateFilterLabels();
-        if (useDuckDB) { debouncedFilterUpdate(); } else { draw(); drawHistograms(); }
+        if (useDuckDB) { debouncedFilterUpdate(); } else { rebuildDisplayData(); buildSpatialGrid(); draw(); drawHistograms(); }
     };
 
     massMaxSlider.oninput = (e) => {
@@ -951,12 +1092,19 @@ function init() {
             massMinSlider.value = filterMassMin;
         }
         updateFilterLabels();
-        if (useDuckDB) { debouncedFilterUpdate(); } else { draw(); drawHistograms(); }
+        if (useDuckDB) { debouncedFilterUpdate(); } else { rebuildDisplayData(); draw(); drawHistograms(); }
     };
 
     function animate(timestamp) {
         animationTime = timestamp;
-        draw();
+        // Throttle redraws: only redraw at full speed if pulsars are shown
+        // Otherwise limit to ~10fps to save CPU on large catalogs
+        if (showPulsars || isDrawing || hoveredPoint) {
+            draw();
+        } else if (!animate._lastDraw || timestamp - animate._lastDraw > 100) {
+            animate._lastDraw = timestamp;
+            draw();
+        }
         requestAnimationFrame(animate);
     }
     requestAnimationFrame(animate);
@@ -997,7 +1145,8 @@ function buildSpatialGrid() {
     const rows = Math.ceil(HEIGHT / cellSize);
     spatialGrid = { cellSize, cols, rows, bins: new Array(cols * rows).fill(null).map(() => []) };
 
-    projectedData.forEach(d => {
+    // Index only the filtered/capped displayData so hover matches what's rendered
+    displayData.forEach(d => {
         let c = Math.floor(d.px / cellSize);
         let r = Math.floor(d.py / cellSize);
         if (c >= 0 && c < cols && r >= 0 && r < rows) {
@@ -1268,7 +1417,8 @@ function draw() {
     ctx.ellipse(WIDTH / 2, HEIGHT / 2, rx, ry, 0, 0, 2 * PI);
     ctx.stroke();
 
-    const allVisible = getVisiblePoints();
+    // Use capped displayData for rendering (randomly sampled if > RENDER_CAP)
+    const allVisible = displayData;
     const unselectedGalaxies = [];
     const selectedGalaxies = [];
 
@@ -1523,106 +1673,230 @@ function drawCoordinateGrid(g) {
 }
 
 function drawPosterior() {
-    if (healpixMap) {
-        drawPosteriorHealpix();
-        return;
-    }
-    // Fallback: MCMC screen-space posterior
-    if (!posteriorMap) return;
-    const { probs, sorted, cols, rows, res } = posteriorMap;
-    let sum = 0;
-    let thresh = 0;
-    for (let p of sorted) {
-        sum += p;
-        if (sum >= credibleLevel) { thresh = p; break; }
-    }
+    if (!healpixMap && !posteriorMap) return;
 
-    ctx.fillStyle = 'rgba(239, 68, 68, 0.3)';
-    for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-            if (probs[r * cols + c] >= thresh && probs[r * cols + c] > 0) {
-                ctx.fillRect(c * res, r * res, res, res);
+    // Rasterize posterior onto a screen-space grid
+    const res = 4; // pixel resolution of the density grid
+    const gCols = Math.ceil(WIDTH / res);
+    const gRows = Math.ceil(HEIGHT / res);
+    const grid = new Float64Array(gCols * gRows);
+
+    if (healpixMap) {
+        // Rasterize HEALPix pixels onto the grid
+        healpixMap.pixels.forEach(px => {
+            let coord1, coord2;
+            if (coordSystem === 'galactic') {
+                const gal = equatorialToGalactic(px.ra, px.dec);
+                coord1 = gal.l; coord2 = gal.b;
+            } else {
+                coord1 = px.ra; coord2 = px.dec;
+            }
+            const p = projectMollweide(coord1, coord2);
+            // Spread each pixel across a small kernel so the rasterization is smooth
+            const kernelR = Math.max(2, Math.ceil(SCALE * 0.04 / res));
+            const gc = Math.round(p.x / res);
+            const gr = Math.round(p.y / res);
+            for (let dr = -kernelR; dr <= kernelR; dr++) {
+                for (let dc = -kernelR; dc <= kernelR; dc++) {
+                    const rr = gr + dr, cc = gc + dc;
+                    if (rr >= 0 && rr < gRows && cc >= 0 && cc < gCols) {
+                        const dist2 = dr * dr + dc * dc;
+                        if (dist2 <= kernelR * kernelR) {
+                            const w = Math.exp(-dist2 / (2 * (kernelR * 0.5) ** 2));
+                            grid[rr * gCols + cc] += px.prob * w;
+                        }
+                    }
+                }
+            }
+        });
+    } else if (posteriorMap) {
+        // Use MCMC screen-space posterior (already a grid)
+        const { probs, cols, rows, res: pRes } = posteriorMap;
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                const val = probs[r * cols + c];
+                if (val <= 0) continue;
+                // Map from posteriorMap grid to our finer grid
+                const gc = Math.floor((c * pRes + pRes / 2) / res);
+                const gr = Math.floor((r * pRes + pRes / 2) / res);
+                if (gc >= 0 && gc < gCols && gr >= 0 && gr < gRows) {
+                    grid[gr * gCols + gc] += val;
+                }
             }
         }
     }
-}
 
-function drawPosteriorHealpix() {
-    if (!healpixMap) return;
-    const thresh = getCredibleThreshold(credibleLevel);
-    const maxProb = healpixMap.sorted[0]?.prob || 1;
+    // Normalize grid to [0, 1]
+    let maxVal = 0;
+    for (let i = 0; i < grid.length; i++) if (grid[i] > maxVal) maxVal = grid[i];
+    if (maxVal > 0) for (let i = 0; i < grid.length; i++) grid[i] /= maxVal;
 
-    ctx.save();
-    ctx.globalAlpha = 0.55;
+    // Compute cumulative probability thresholds
+    // Sort grid values descending, accumulate to find iso-levels
+    const nonzero = [];
+    for (let i = 0; i < grid.length; i++) if (grid[i] > 0) nonzero.push(grid[i]);
+    nonzero.sort((a, b) => b - a);
+    const totalProb = nonzero.reduce((s, v) => s + v, 0);
 
-    // Draw each nonzero HEALPix pixel as a small filled region
-    healpixMap.pixels.forEach(px => {
-        if (px.prob < thresh) return; // outside credible region
+    function getContourThreshold(credLevel) {
+        let cumSum = 0;
+        for (const v of nonzero) {
+            cumSum += v / totalProb;
+            if (cumSum >= credLevel) return v;
+        }
+        return 0;
+    }
 
-        // Get display coordinates
-        let coord1, coord2;
-        if (coordSystem === 'galactic') {
-            const gal = equatorialToGalactic(px.ra, px.dec);
-            coord1 = gal.l;
-            coord2 = gal.b;
-        } else {
-            coord1 = px.ra;
-            coord2 = px.dec;
+    // Define contour levels: inner (50%), user-selected, and outer (90%)
+    const levels = [];
+    // Always show 50% and 90% contours
+    const t50 = getContourThreshold(0.5);
+    const t90 = getContourThreshold(0.9);
+    const tUser = getContourThreshold(credibleLevel);
+
+    levels.push({ threshold: t50, label: '50%', color: 'rgba(34, 211, 238, 0.35)', stroke: 'rgba(34, 211, 238, 0.9)', lineWidth: 2.0 });
+    // Only add user level if it's distinct from 50% and 90%
+    if (Math.abs(credibleLevel - 0.5) > 0.05 && Math.abs(credibleLevel - 0.9) > 0.05) {
+        levels.push({ threshold: tUser, label: `${Math.round(credibleLevel * 100)}%`, color: 'rgba(139, 92, 246, 0.2)', stroke: 'rgba(139, 92, 246, 0.8)', lineWidth: 1.5 });
+    }
+    levels.push({ threshold: t90, label: '90%', color: 'rgba(239, 68, 68, 0.15)', stroke: 'rgba(239, 68, 68, 0.7)', lineWidth: 1.5 });
+
+    // Sort levels by threshold descending (draw outermost first)
+    levels.sort((a, b) => a.threshold - b.threshold);
+
+    // --- Marching squares contour tracing ---
+    function traceContours(threshold) {
+        const paths = [];
+        const visited = new Uint8Array(gCols * gRows);
+
+        // For each edge between cells, check if it crosses the threshold
+        // Build segments then chain them into paths
+        const segments = [];
+
+        for (let r = 0; r < gRows - 1; r++) {
+            for (let c = 0; c < gCols - 1; c++) {
+                const tl = grid[r * gCols + c] >= threshold ? 1 : 0;
+                const tr = grid[r * gCols + c + 1] >= threshold ? 1 : 0;
+                const br = grid[(r + 1) * gCols + c + 1] >= threshold ? 1 : 0;
+                const bl = grid[(r + 1) * gCols + c] >= threshold ? 1 : 0;
+                const caseIdx = tl * 8 + tr * 4 + br * 2 + bl;
+
+                if (caseIdx === 0 || caseIdx === 15) continue;
+
+                // Interpolation helpers
+                const v_tl = grid[r * gCols + c];
+                const v_tr = grid[r * gCols + c + 1];
+                const v_br = grid[(r + 1) * gCols + c + 1];
+                const v_bl = grid[(r + 1) * gCols + c];
+
+                const lerp = (v1, v2) => {
+                    const denom = v2 - v1;
+                    return Math.abs(denom) < 1e-12 ? 0.5 : (threshold - v1) / denom;
+                };
+
+                const top = { x: (c + lerp(v_tl, v_tr)) * res, y: r * res };
+                const right = { x: (c + 1) * res, y: (r + lerp(v_tr, v_br)) * res };
+                const bottom = { x: (c + lerp(v_bl, v_br)) * res, y: (r + 1) * res };
+                const left = { x: c * res, y: (r + lerp(v_tl, v_bl)) * res };
+
+                const addSeg = (a, b) => segments.push([a, b]);
+
+                switch (caseIdx) {
+                    case 1: addSeg(left, bottom); break;
+                    case 2: addSeg(bottom, right); break;
+                    case 3: addSeg(left, right); break;
+                    case 4: addSeg(top, right); break;
+                    case 5: addSeg(left, top); addSeg(bottom, right); break; // saddle
+                    case 6: addSeg(top, bottom); break;
+                    case 7: addSeg(left, top); break;
+                    case 8: addSeg(top, left); break;
+                    case 9: addSeg(top, bottom); break;
+                    case 10: addSeg(top, right); addSeg(left, bottom); break; // saddle
+                    case 11: addSeg(top, right); break;
+                    case 12: addSeg(left, right); break;
+                    case 13: addSeg(bottom, right); break;
+                    case 14: addSeg(left, bottom); break;
+                }
+            }
         }
 
-        const p = projectMollweide(coord1, coord2);
+        // Chain segments into polylines
+        if (segments.length === 0) return [];
 
-        // Color by probability (normalized to max)
-        const t = Math.pow(px.prob / maxProb, 0.5); // sqrt scaling for better contrast
-        const c = viridisColor(t);
+        const eps = res * 0.5;
+        const used = new Uint8Array(segments.length);
 
-        // Approximate pixel angular size for NSIDE=16: ~3.66 degrees
-        // Draw a small filled circle proportional to pixel area
-        const pixRadius = Math.max(3, SCALE * 0.065); // ~3.66 deg in Mollweide scale
-
-        ctx.fillStyle = `rgb(${c.r}, ${c.g}, ${c.b})`;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, pixRadius, 0, 2 * PI);
-        ctx.fill();
-    });
-
-    ctx.restore();
-
-    // Draw credible region boundary
-    drawCredibleBoundary(thresh);
-}
-
-function drawCredibleBoundary(thresh) {
-    if (!healpixMap) return;
-    // Draw a glowing outline around the credible region pixels
-    ctx.save();
-    ctx.strokeStyle = 'rgba(34, 211, 238, 0.7)';
-    ctx.lineWidth = 1.5;
-    ctx.shadowColor = 'rgba(34, 211, 238, 0.5)';
-    ctx.shadowBlur = 8;
-
-    // Collect projected positions of boundary pixels
-    const regionPixels = healpixMap.pixels.filter(px => px.prob >= thresh);
-    if (regionPixels.length === 0) { ctx.restore(); return; }
-
-    // Simple convex-hull-like boundary: draw the outline of the region
-    // For now, draw individual pixel outlines
-    regionPixels.forEach(px => {
-        let coord1, coord2;
-        if (coordSystem === 'galactic') {
-            const gal = equatorialToGalactic(px.ra, px.dec);
-            coord1 = gal.l;
-            coord2 = gal.b;
-        } else {
-            coord1 = px.ra;
-            coord2 = px.dec;
+        function ptClose(a, b) {
+            return Math.abs(a.x - b.x) < eps && Math.abs(a.y - b.y) < eps;
         }
-        const p = projectMollweide(coord1, coord2);
-        const pixRadius = Math.max(3, SCALE * 0.065);
 
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, pixRadius + 1, 0, 2 * PI);
-        ctx.stroke();
+        for (let i = 0; i < segments.length; i++) {
+            if (used[i]) continue;
+            used[i] = 1;
+            const path = [segments[i][0], segments[i][1]];
+
+            let changed = true;
+            while (changed) {
+                changed = false;
+                for (let j = 0; j < segments.length; j++) {
+                    if (used[j]) continue;
+                    const last = path[path.length - 1];
+                    const first = path[0];
+                    if (ptClose(last, segments[j][0])) {
+                        path.push(segments[j][1]); used[j] = 1; changed = true;
+                    } else if (ptClose(last, segments[j][1])) {
+                        path.push(segments[j][0]); used[j] = 1; changed = true;
+                    } else if (ptClose(first, segments[j][1])) {
+                        path.unshift(segments[j][0]); used[j] = 1; changed = true;
+                    } else if (ptClose(first, segments[j][0])) {
+                        path.unshift(segments[j][1]); used[j] = 1; changed = true;
+                    }
+                }
+            }
+            if (path.length >= 3) paths.push(path);
+        }
+
+        return paths;
+    }
+
+    ctx.save();
+
+    // Draw each contour level (outermost first)
+    levels.forEach(level => {
+        const paths = traceContours(level.threshold);
+        if (paths.length === 0) return;
+
+        // Fill
+        ctx.fillStyle = level.color;
+        paths.forEach(path => {
+            ctx.beginPath();
+            ctx.moveTo(path[0].x, path[0].y);
+            for (let i = 1; i < path.length; i++) ctx.lineTo(path[i].x, path[i].y);
+            ctx.closePath();
+            ctx.fill();
+        });
+
+        // Stroke
+        ctx.strokeStyle = level.stroke;
+        ctx.lineWidth = level.lineWidth;
+        ctx.shadowColor = level.stroke;
+        ctx.shadowBlur = 4;
+        paths.forEach(path => {
+            ctx.beginPath();
+            ctx.moveTo(path[0].x, path[0].y);
+            for (let i = 1; i < path.length; i++) ctx.lineTo(path[i].x, path[i].y);
+            ctx.closePath();
+            ctx.stroke();
+        });
+        ctx.shadowBlur = 0;
+
+        // Label the contour
+        if (paths.length > 0 && paths[0].length > 2) {
+            const labelPt = paths[0][Math.floor(paths[0].length / 4)];
+            ctx.font = '10px Inter, sans-serif';
+            ctx.fillStyle = level.stroke;
+            ctx.fillText(level.label, labelPt.x + 4, labelPt.y - 4);
+        }
     });
 
     ctx.restore();
@@ -1924,7 +2198,7 @@ function closeSelection() {
     }
 
     const vs = lassoPoints.map(p => [p.x, p.y]);
-    projectedData.forEach(d => {
+    displayData.forEach(d => {
         if (!showPulsars && d.type === 'Pulsar') return;
         const x = d.px, y = d.py;
         let inside = false;
@@ -2138,7 +2412,12 @@ function updateFilterLabels() {
 }
 
 function updateStats() {
-    document.getElementById('count-sel').innerText = selectedIds.size;
+    // Count selected galaxies that are in the current filtered display
+    let count = 0;
+    displayData.forEach(d => {
+        if (d.type !== 'Pulsar' && selectedIds.has(d.id)) count++;
+    });
+    document.getElementById('count-sel').innerText = count;
 }
 
 function showInspector(items) {
